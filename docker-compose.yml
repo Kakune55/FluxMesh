@@ -1,0 +1,118 @@
+name: fluxmesh
+
+services:
+  # profile: s1a
+  server-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - --role=server
+      - --cluster-state=new
+      - --node-id=server-1
+      - --ip=server-1
+      - --data-dir=/data
+      - --client-listen-url=http://0.0.0.0:2379
+      - --client-advertise-url=http://server-1:2379
+      - --peer-listen-url=http://0.0.0.0:2380
+      - --peer-advertise-url=http://server-1:2380
+      - --admin-addr=:15000
+    ports:
+      - "15000:15000"
+      - "2379:2379"
+      - "2380:2380"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:15000/health >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - ./data/docker/server-1:/data
+    networks:
+      - fluxmesh
+    profiles: ["s1a", "3s"]
+
+  # profile: s1a
+  agent-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - --role=agent
+      - --node-id=agent-1
+      - --ip=agent-1
+      - --seed-endpoints=http://server-1:2379
+      - --admin-addr=:15000
+    ports:
+      - "15001:15000"
+    depends_on:
+      server-1:
+        condition: service_healthy
+    networks:
+      - fluxmesh
+    profiles: ["s1a"]
+
+  # profile: 3s
+  server-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - --role=server
+      - --cluster-state=existing
+      - --node-id=server-2
+      - --ip=server-2
+      - --data-dir=/data
+      - --client-listen-url=http://0.0.0.0:2379
+      - --client-advertise-url=http://server-2:2379
+      - --peer-listen-url=http://0.0.0.0:2380
+      - --peer-advertise-url=http://server-2:2380
+      - --seed-endpoints=http://server-1:2379
+      - --admin-addr=:15000
+    ports:
+      - "15002:15000"
+    depends_on:
+      server-1:
+        condition: service_healthy
+    restart: on-failure
+    volumes:
+      - ./data/docker/server-2:/data
+    networks:
+      - fluxmesh
+    profiles: ["3s"]
+
+  # profile: 3s
+  server-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - --role=server
+      - --cluster-state=existing
+      - --node-id=server-3
+      - --ip=server-3
+      - --data-dir=/data
+      - --client-listen-url=http://0.0.0.0:2379
+      - --client-advertise-url=http://server-3:2379
+      - --peer-listen-url=http://0.0.0.0:2380
+      - --peer-advertise-url=http://server-3:2380
+      - --seed-endpoints=http://server-1:2379
+      - --admin-addr=:15000
+    ports:
+      - "15003:15000"
+    depends_on:
+      server-1:
+        condition: service_healthy
+      server-2:
+        condition: service_started
+    restart: on-failure
+    volumes:
+      - ./data/docker/server-3:/data
+    networks:
+      - fluxmesh
+    profiles: ["3s"]
+
+networks:
+  fluxmesh:
+    driver: bridge
