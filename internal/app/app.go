@@ -215,7 +215,7 @@ func (a *App) consumeKeepAlive(ctx context.Context) {
 				continue
 			}
 			if resp != nil {
-				logx.Info("收到租约保活响应", "lease_id", int64(resp.ID), "ttl", resp.TTL)
+				logx.Debug("收到租约保活响应", "lease_id", int64(resp.ID), "ttl", resp.TTL)
 			}
 		}
 	}
@@ -315,7 +315,7 @@ func (a *App) updateNodeMetrics(ctx context.Context) {
 	a.selfNode = node
 	a.nodeMu.Unlock()
 
-	logx.Info("节点指标已更新",
+	logx.Debug("节点指标已更新",
 		"node_id", node.ID,
 		"cpu_usage", node.SysLoad.CPUUsage,
 		"memory_usage", node.SysLoad.MemoryUsage,

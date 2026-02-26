@@ -23,7 +23,7 @@ func StartEmbeddedServer(cfg config.Config, initialCluster string) (*EmbeddedSer
 	ec.Dir = filepath.Join(cfg.DataDir, cfg.NodeID)
 	ec.InitialCluster = initialCluster
 	ec.ClusterState = string(cfg.ClusterState)
-	ec.LogLevel = "warn"
+	ec.LogLevel = "info"
 
 	clientListen, err := parseURL(cfg.ClientListenURL)
 	if err != nil {

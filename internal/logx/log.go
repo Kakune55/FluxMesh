@@ -7,6 +7,10 @@ import (
 
 var logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+func Debug(msg string, args ...any) {
+	logger.Debug(msg, args...)
+}
+
 func Info(msg string, args ...any) {
 	logger.Info(msg, args...)
 }
