@@ -34,6 +34,7 @@ type App struct {
 	leaseID      clientv3.LeaseID
 	keepAliveCh  <-chan *clientv3.LeaseKeepAliveResponse
 	leaseMu      sync.RWMutex
+	appCtx       context.Context
 	cancel       context.CancelFunc
 	backgroundWG sync.WaitGroup
 }
@@ -63,6 +64,7 @@ func New(cfg config.Config) (*App, error) {
 
 func (a *App) Run(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
+	a.appCtx = ctx
 	a.cancel = cancel
 
 	// 后台执行 Pending-Reconcile 任务，兜底清理失败成员。
@@ -220,7 +222,7 @@ func (a *App) consumeKeepAlive(ctx context.Context) {
 }
 
 func (a *App) registerNodeLease(ctx context.Context) error {
-	leaseID, keepAliveCh, err := a.nodes.RegisterWithLease(ctx, a.currentNode(), a.cfg.LeaseTTLSeconds)
+	leaseID, keepAliveCh, err := a.nodes.RegisterWithLease(ctx, a.appCtx, a.currentNode(), a.cfg.LeaseTTLSeconds)
 	if err != nil {
 		return err
 	}

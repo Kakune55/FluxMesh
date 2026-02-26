@@ -24,9 +24,9 @@ func NewService(cli *clientv3.Client) *Service {
 	return &Service{client: cli, lease: cli, watch: cli}
 }
 
-func (s *Service) RegisterWithLease(ctx context.Context, node model.Node, ttl int64) (clientv3.LeaseID, <-chan *clientv3.LeaseKeepAliveResponse, error) {
+func (s *Service) RegisterWithLease(opCtx, keepAliveCtx context.Context, node model.Node, ttl int64) (clientv3.LeaseID, <-chan *clientv3.LeaseKeepAliveResponse, error) {
 	// 申请租约并把节点注册键绑定到该租约，失联后自动过期删除。
-	leaseResp, err := s.lease.Grant(ctx, ttl)
+	leaseResp, err := s.lease.Grant(opCtx, ttl)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -37,12 +37,12 @@ func (s *Service) RegisterWithLease(ctx context.Context, node model.Node, ttl in
 		return 0, nil, err
 	}
 
-	_, err = s.client.Put(ctx, key, string(payload), clientv3.WithLease(leaseResp.ID))
+	_, err = s.client.Put(opCtx, key, string(payload), clientv3.WithLease(leaseResp.ID))
 	if err != nil {
 		return 0, nil, err
 	}
 
-	keepAliveCh, err := s.lease.KeepAlive(ctx, leaseResp.ID)
+	keepAliveCh, err := s.lease.KeepAlive(keepAliveCtx, leaseResp.ID)
 	if err != nil {
 		return 0, nil, err
 	}
