@@ -296,9 +296,9 @@ func (a *App) updateNodeMetrics(ctx context.Context) {
 	}
 
 	node := a.currentNode()
-	node.CPUUsage = round2(snapshot.CPUUsage)
-	node.MemoryUsage = round2(snapshot.MemoryUsage)
-	node.SystemLoad1m = round2(snapshot.SystemLoad1m)
+	node.SysLoad.CPUUsage = round2(snapshot.CPUUsage)
+	node.SysLoad.MemoryUsage = round2(snapshot.MemoryUsage)
+	node.SysLoad.SystemLoad1m = round2(snapshot.SystemLoad1m)
 	node.Load = int(math.Round(snapshot.CPUUsage))
 
 	attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -315,9 +315,9 @@ func (a *App) updateNodeMetrics(ctx context.Context) {
 
 	logx.Info("节点指标已更新",
 		"node_id", node.ID,
-		"cpu_usage", node.CPUUsage,
-		"memory_usage", node.MemoryUsage,
-		"system_load_1m", node.SystemLoad1m,
+		"cpu_usage", node.SysLoad.CPUUsage,
+		"memory_usage", node.SysLoad.MemoryUsage,
+		"system_load_1m", node.SysLoad.SystemLoad1m,
 	)
 }
 

@@ -27,8 +27,8 @@ services:
       timeout: 2s
       retries: 20
       start_period: 5s
-    volumes:
-      - ./data/docker/server-1:/data
+    # volumes:
+    #   - ./data/docker/server-1:/data
     networks:
       - fluxmesh
     profiles: ["s1a", "3s"]
@@ -76,8 +76,8 @@ services:
       server-1:
         condition: service_healthy
     restart: on-failure
-    volumes:
-      - ./data/docker/server-2:/data
+    # volumes:
+    #   - ./data/docker/server-2:/data
     networks:
       - fluxmesh
     profiles: ["3s"]
@@ -107,8 +107,8 @@ services:
       server-2:
         condition: service_started
     restart: on-failure
-    volumes:
-      - ./data/docker/server-3:/data
+    # volumes:
+    #   - ./data/docker/server-3:/data
     networks:
       - fluxmesh
     profiles: ["3s"]
