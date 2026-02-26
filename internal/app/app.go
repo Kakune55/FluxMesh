@@ -82,13 +82,16 @@ func (a *App) Run(parent context.Context) error {
 
 	a.nodes = registry.NewService(a.client)
 	// 首次注册节点元信息，并绑定租约确保失联自动过期。
+	nodeStatus := model.NodeStatus{
+		NodeRole: string(a.cfg.Role),
+		NodeStatus: "Ready",
+	}
+
 	node := model.Node{
 		ID:      a.cfg.NodeID,
 		IP:      a.cfg.IP,
 		Version: a.cfg.Version,
-		Role:    string(a.cfg.Role),
-		Status:  "Ready",
-		Load:    0,
+		NodeStatus: nodeStatus,
 	}
 	a.selfNode = node
 
@@ -301,7 +304,8 @@ func (a *App) updateNodeMetrics(ctx context.Context) {
 	node.SysLoad.CPUUsage = round2(snapshot.CPUUsage)
 	node.SysLoad.MemoryUsage = round2(snapshot.MemoryUsage)
 	node.SysLoad.SystemLoad1m = round2(snapshot.SystemLoad1m)
-	node.Load = int(math.Round(snapshot.CPUUsage))
+	node.SysLoad.SystemLoad5m = round2(snapshot.SystemLoad5m)
+	node.SysLoad.SystemLoad15m = round2(snapshot.SystemLoad15m)
 
 	attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	err = a.nodes.UpdateNodeWithLease(attemptCtx, node, a.currentLeaseID())

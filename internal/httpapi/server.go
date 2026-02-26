@@ -61,7 +61,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nodes, err := s.nodes.ListNodes(r.Context())
+	nodes, err := s.nodes.ListNodesWithEtcdRole(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

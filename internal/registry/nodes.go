@@ -15,13 +15,14 @@ import (
 const nodesPrefix = "/mesh/nodes/"
 
 type Service struct {
-	client clientv3.KV
+	cli    *clientv3.Client
+	kv     clientv3.KV
 	lease  clientv3.Lease
 	watch  clientv3.Watcher
 }
 
 func NewService(cli *clientv3.Client) *Service {
-	return &Service{client: cli, lease: cli, watch: cli}
+	return &Service{cli: cli, kv: cli, lease: cli, watch: cli}
 }
 
 func (s *Service) RegisterWithLease(opCtx, keepAliveCtx context.Context, node model.Node, ttl int64) (clientv3.LeaseID, <-chan *clientv3.LeaseKeepAliveResponse, error) {
@@ -37,7 +38,7 @@ func (s *Service) RegisterWithLease(opCtx, keepAliveCtx context.Context, node mo
 		return 0, nil, err
 	}
 
-	_, err = s.client.Put(opCtx, key, string(payload), clientv3.WithLease(leaseResp.ID))
+	_, err = s.kv.Put(opCtx, key, string(payload), clientv3.WithLease(leaseResp.ID))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -65,12 +66,12 @@ func (s *Service) UpdateNodeWithLease(ctx context.Context, node model.Node, leas
 		return err
 	}
 
-	_, err = s.client.Put(ctx, nodeKey(node.ID), string(payload), clientv3.WithLease(leaseID))
+	_, err = s.kv.Put(ctx, nodeKey(node.ID), string(payload), clientv3.WithLease(leaseID))
 	return err
 }
 
 func (s *Service) ListNodes(ctx context.Context) ([]model.Node, error) {
-	resp, err := s.client.Get(ctx, nodesPrefix, clientv3.WithPrefix())
+	resp, err := s.kv.Get(ctx, nodesPrefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
@@ -87,8 +88,69 @@ func (s *Service) ListNodes(ctx context.Context) ([]model.Node, error) {
 	return nodes, nil
 }
 
+func (s *Service) ListNodesWithEtcdRole(ctx context.Context) ([]model.Node, error) {
+	nodes, err := s.ListNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(nodes) == 0 {
+		return nodes, nil
+	}
+
+	endpoint := ""
+	for _, e := range s.cli.Endpoints() {
+		e = strings.TrimSpace(e)
+		if e != "" {
+			endpoint = e
+			break
+		}
+	}
+	if endpoint == "" {
+		return markUnknownEtcdRoles(nodes), nil
+	}
+
+	statusResp, err := s.cli.Status(ctx, endpoint)
+	if err != nil {
+		logx.Warn("查询 etcd 选举状态失败", "endpoint", endpoint, "err", err)
+		return markUnknownEtcdRoles(nodes), nil
+	}
+
+	membersResp, err := s.cli.MemberList(ctx)
+	if err != nil {
+		logx.Warn("查询 etcd 成员列表失败", "endpoint", endpoint, "err", err)
+		return markUnknownEtcdRoles(nodes), nil
+	}
+
+	memberRoleByName := make(map[string]string, len(membersResp.Members))
+	for _, member := range membersResp.Members {
+		if member == nil {
+			continue
+		}
+		if member.ID == statusResp.Leader {
+			memberRoleByName[member.Name] = "leader"
+			continue
+		}
+		memberRoleByName[member.Name] = "follower"
+	}
+
+	for i := range nodes {
+		if nodes[i].NodeStatus.NodeRole != "server" {
+			nodes[i].NodeStatus.EtcdRole = "agent"
+			continue
+		}
+		if role, ok := memberRoleByName[nodes[i].ID]; ok {
+			nodes[i].NodeStatus.EtcdRole = role
+			continue
+		}
+		nodes[i].NodeStatus.EtcdRole = "unknown"
+	}
+
+	return nodes, nil
+}
+
 func (s *Service) GetNode(ctx context.Context, id string) (model.Node, error) {
-	resp, err := s.client.Get(ctx, nodeKey(id))
+	resp, err := s.kv.Get(ctx, nodeKey(id))
 	if err != nil {
 		return model.Node{}, err
 	}
@@ -105,4 +167,15 @@ func (s *Service) GetNode(ctx context.Context, id string) (model.Node, error) {
 
 func nodeKey(id string) string {
 	return nodesPrefix + strings.TrimSpace(id)
+}
+
+func markUnknownEtcdRoles(nodes []model.Node) []model.Node {
+	for i := range nodes {
+		if nodes[i].NodeStatus.NodeRole == "server" {
+			nodes[i].NodeStatus.EtcdRole = "unknown"
+			continue
+		}
+		nodes[i].NodeStatus.EtcdRole = "agent"
+	}
+	return nodes
 }
