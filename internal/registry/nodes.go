@@ -3,7 +3,9 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"fluxmesh/internal/logx"
@@ -13,6 +15,9 @@ import (
 )
 
 const nodesPrefix = "/mesh/nodes/"
+
+var ErrNodeNotFound = errors.New("node not found")
+var ErrLeaderEvictRequiresForce = errors.New("evicting leader requires force=true")
 
 type Service struct {
 	cli    *clientv3.Client
@@ -155,7 +160,7 @@ func (s *Service) GetNode(ctx context.Context, id string) (model.Node, error) {
 		return model.Node{}, err
 	}
 	if len(resp.Kvs) == 0 {
-		return model.Node{}, fmt.Errorf("node not found")
+		return model.Node{}, ErrNodeNotFound
 	}
 
 	var node model.Node
@@ -163,6 +168,153 @@ func (s *Service) GetNode(ctx context.Context, id string) (model.Node, error) {
 		return model.Node{}, err
 	}
 	return node, nil
+}
+
+func (s *Service) EvictNode(ctx context.Context, id string, force bool) (model.NodeEvictResult, error) {
+	id = strings.TrimSpace(id)
+	node, err := s.GetNode(ctx, id)
+	if err != nil {
+		return model.NodeEvictResult{}, err
+	}
+
+	var (
+		targetMemberID uint64
+		isLeader       bool
+	)
+
+	if node.NodeStatus.NodeRole == "server" {
+		membersResp, err := s.cli.MemberList(ctx)
+		if err != nil {
+			return model.NodeEvictResult{}, err
+		}
+
+		for _, member := range membersResp.Members {
+			if member == nil {
+				continue
+			}
+			if member.Name == id {
+				targetMemberID = member.ID
+				break
+			}
+		}
+
+		if targetMemberID != 0 {
+			endpoint := ""
+			for _, e := range s.cli.Endpoints() {
+				e = strings.TrimSpace(e)
+				if e != "" {
+					endpoint = e
+					break
+				}
+			}
+			if endpoint == "" {
+				return model.NodeEvictResult{}, fmt.Errorf("no etcd endpoint configured")
+			}
+
+			statusResp, err := s.cli.Status(ctx, endpoint)
+			if err != nil {
+				return model.NodeEvictResult{}, err
+			}
+			isLeader = statusResp.Leader == targetMemberID
+			if isLeader && !force {
+				return model.NodeEvictResult{}, ErrLeaderEvictRequiresForce
+			}
+		}
+	}
+
+	deleteResp, err := s.kv.Delete(ctx, nodeKey(id))
+	if err != nil {
+		return model.NodeEvictResult{}, err
+	}
+
+	result := model.NodeEvictResult{
+		NodeID:      id,
+		NodeRole:    node.NodeStatus.NodeRole,
+		NodeDeleted: deleteResp.Deleted > 0,
+	}
+
+	if node.NodeStatus.NodeRole != "server" {
+		return result, nil
+	}
+
+	if targetMemberID == 0 {
+		return result, nil
+	}
+
+	if _, err := s.cli.MemberRemove(ctx, targetMemberID); err != nil {
+		return result, err
+	}
+
+	result.MemberID = targetMemberID
+	result.MemberRemoved = true
+	return result, nil
+}
+
+func (s *Service) ClusterStatus(ctx context.Context) (model.ClusterStatus, error) {
+	endpoint := ""
+	for _, e := range s.cli.Endpoints() {
+		e = strings.TrimSpace(e)
+		if e != "" {
+			endpoint = e
+			break
+		}
+	}
+	if endpoint == "" {
+		return model.ClusterStatus{}, fmt.Errorf("no etcd endpoint configured")
+	}
+
+	statusResp, err := s.cli.Status(ctx, endpoint)
+	if err != nil {
+		return model.ClusterStatus{}, err
+	}
+
+	membersResp, err := s.cli.MemberList(ctx)
+	if err != nil {
+		return model.ClusterStatus{}, err
+	}
+
+	members := make([]model.ClusterMemberStatus, 0, len(membersResp.Members))
+	for _, member := range membersResp.Members {
+		if member == nil {
+			continue
+		}
+
+		role := "follower"
+		if member.ID == statusResp.Leader {
+			role = "leader"
+		}
+		if member.IsLearner {
+			role = "learner"
+		}
+
+		members = append(members, model.ClusterMemberStatus{
+			ID:         member.ID,
+			Name:       member.Name,
+			Role:       role,
+			IsLearner:  member.IsLearner,
+			PeerURLs:   member.PeerURLs,
+			ClientURLs: member.ClientURLs,
+		})
+	}
+
+	sort.Slice(members, func(i, j int) bool {
+		if members[i].Name == members[j].Name {
+			return members[i].ID < members[j].ID
+		}
+		return members[i].Name < members[j].Name
+	})
+
+	return model.ClusterStatus{
+		Endpoint:         endpoint,
+		ClusterID:        statusResp.Header.ClusterId,
+		CurrentMemberID:  statusResp.Header.MemberId,
+		LeaderID:         statusResp.Leader,
+		RaftTerm:         statusResp.RaftTerm,
+		RaftIndex:        statusResp.RaftIndex,
+		RaftAppliedIndex: statusResp.RaftAppliedIndex,
+		DBSize:           statusResp.DbSize,
+		Members:          members,
+	}, nil
 }
 
 func nodeKey(id string) string {

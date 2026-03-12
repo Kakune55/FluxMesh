@@ -26,6 +26,7 @@ func NewServer(addr string, nodes *registry.Service, services *registry.Services
 	mux := http.NewServeMux()
 	// MVP 仅暴露健康探针与节点拓扑查询接口。
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
 	mux.HandleFunc("/api/v1/nodes/", s.handleNodeByID)
 	mux.HandleFunc("/api/v1/services", s.handleServices)
@@ -73,12 +74,22 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, nodes)
 }
 
-func (s *Server) handleNodeByID(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
 
+	status, err := s.nodes.ClusterStatus(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/v1/nodes/")
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -86,12 +97,37 @@ func (s *Server) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	node, err := s.nodes.GetNode(r.Context(), id)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
-		return
+	switch r.Method {
+	case http.MethodGet:
+		node, err := s.nodes.GetNode(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, registry.ErrNodeNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, node)
+	case http.MethodDelete:
+		force := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("force")), "true")
+		result, err := s.nodes.EvictNode(r.Context(), id, force)
+		if err != nil {
+			if errors.Is(err, registry.ErrNodeNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+				return
+			}
+			if errors.Is(err, registry.ErrLeaderEvictRequiresForce) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
-	writeJSON(w, http.StatusOK, node)
 }
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
