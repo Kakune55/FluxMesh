@@ -4,27 +4,31 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"fluxmesh/internal/logx"
+	"fluxmesh/internal/model"
 	"fluxmesh/internal/registry"
 )
 
 type Server struct {
 	httpServer *http.Server
 	nodes      *registry.Service
+	services   *registry.Services
 	version    string
 }
 
-func NewServer(addr string, nodes *registry.Service, version string) *Server {
-	s := &Server{nodes: nodes, version: version}
+func NewServer(addr string, nodes *registry.Service, services *registry.Services, version string) *Server {
+	s := &Server{nodes: nodes, services: services, version: version}
 	mux := http.NewServeMux()
 	// MVP 仅暴露健康探针与节点拓扑查询接口。
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
 	mux.HandleFunc("/api/v1/nodes/", s.handleNodeByID)
+	mux.HandleFunc("/api/v1/services", s.handleServices)
 
 	s.httpServer = &http.Server{
 		Addr:              addr,
@@ -88,6 +92,49 @@ func (s *Server) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, node)
+}
+
+func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
+	if s.services == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "services storage not initialized"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		services, err := s.services.List(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, services)
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read request body"})
+			return
+		}
+
+		var cfg model.ServiceConfig
+		if err := json.Unmarshal(body, &cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json payload"})
+			return
+		}
+
+		if err := cfg.Validate(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+
+		if err := s.services.Put(r.Context(), cfg); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, cfg)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
 }
 
 func writeJSON(w http.ResponseWriter, code int, data any) {

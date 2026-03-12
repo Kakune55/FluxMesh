@@ -26,6 +26,7 @@ type App struct {
 	embedded     *etcd.EmbeddedServer
 	client       *clientv3.Client
 	nodes        *registry.Service
+	services     *registry.Services
 	http         *httpapi.Server
 	reconciler   *reconcile.MemberReconciler
 	metrics      *sysmetrics.Collector
@@ -81,6 +82,7 @@ func (a *App) Run(parent context.Context) error {
 	}
 
 	a.nodes = registry.NewService(a.client)
+	a.services = registry.NewServices(a.client)
 	// 首次注册节点元信息，并绑定租约确保失联自动过期。
 	nodeStatus := model.NodeStatus{
 		NodeRole: string(a.cfg.Role),
@@ -111,7 +113,7 @@ func (a *App) Run(parent context.Context) error {
 		a.monitorNodeMetrics(ctx)
 	}()
 
-	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.cfg.Version)
+	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.services, a.cfg.Version)
 	return a.http.Start()
 }
 
