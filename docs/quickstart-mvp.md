@@ -132,6 +132,21 @@ curl -s -X POST http://127.0.0.1:15000/api/v1/services \
 
 curl -s http://127.0.0.1:15000/api/v1/services | jq .
 curl -s http://127.0.0.1:15000/api/v1/services/payment-svc | jq .
+
+# 从查询结果中取 resource_version 后执行 CAS 更新
+rev=$(curl -s http://127.0.0.1:15000/api/v1/services/payment-svc | jq -r .resource_version)
+curl -s -X PUT "http://127.0.0.1:15000/api/v1/services/payment-svc?resource_version=${rev}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "payment-svc",
+    "namespace": "prod",
+    "version": "v2",
+    "routes": [
+      {"path_prefix": "/", "destination": "payment-v2", "weight": 100}
+    ]
+  }' | jq .
+
+curl -s -X DELETE http://127.0.0.1:15000/api/v1/services/payment-svc | jq .
 ```
 
 ### 6.3 节点驱逐

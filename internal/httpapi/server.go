@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -175,11 +177,6 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		return
-	}
-
 	name := strings.TrimPrefix(r.URL.Path, "/api/v1/services/")
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -187,17 +184,95 @@ func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := s.services.Get(r.Context(), name)
-	if err != nil {
-		if errors.Is(err, registry.ErrServiceNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+	switch r.Method {
+	case http.MethodGet:
+		item, err := s.services.Get(r.Context(), name)
+		if err != nil {
+			if errors.Is(err, registry.ErrServiceNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+
+		writeJSON(w, http.StatusOK, item)
+	case http.MethodPut:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read request body"})
+			return
+		}
+
+		var cfg model.ServiceConfig
+		if err := json.Unmarshal(body, &cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json payload"})
+			return
+		}
+
+		if cfg.Name != "" && cfg.Name != name {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "service name in path and payload must match"})
+			return
+		}
+		cfg.Name = name
+
+		if err := cfg.Validate(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+
+		rev, err := parseExpectedRevision(r, cfg.ResourceVersion)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+
+		updated, err := s.services.UpdateWithRevision(r.Context(), name, cfg, rev)
+		if err != nil {
+			if errors.Is(err, registry.ErrServiceConflict) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+			if errors.Is(err, registry.ErrServiceNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		err := s.services.Delete(r.Context(), name)
+		if err != nil {
+			if errors.Is(err, registry.ErrServiceNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+func parseExpectedRevision(r *http.Request, fallback int64) (int64, error) {
+	revRaw := strings.TrimSpace(r.URL.Query().Get("resource_version"))
+	if revRaw == "" {
+		if fallback > 0 {
+			return fallback, nil
+		}
+		return 0, fmt.Errorf("resource_version is required for update")
 	}
 
-	writeJSON(w, http.StatusOK, item)
+	rev, err := strconv.ParseInt(revRaw, 10, 64)
+	if err != nil || rev <= 0 {
+		return 0, fmt.Errorf("resource_version must be a positive integer")
+	}
+
+	return rev, nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, data any) {
