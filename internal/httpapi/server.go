@@ -30,6 +30,7 @@ func NewServer(addr string, nodes *registry.Service, services *registry.Services
 	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
 	mux.HandleFunc("/api/v1/nodes/", s.handleNodeByID)
 	mux.HandleFunc("/api/v1/services", s.handleServices)
+	mux.HandleFunc("/api/v1/services/", s.handleServiceByName)
 
 	s.httpServer = &http.Server{
 		Addr:              addr,
@@ -171,6 +172,32 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
+}
+
+func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	name := strings.TrimPrefix(r.URL.Path, "/api/v1/services/")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "service name is required"})
+		return
+	}
+
+	item, err := s.services.Get(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, registry.ErrServiceNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, item)
 }
 
 func writeJSON(w http.ResponseWriter, code int, data any) {

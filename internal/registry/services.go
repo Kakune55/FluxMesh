@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 
 	"fluxmesh/internal/model"
@@ -11,6 +12,8 @@ import (
 )
 
 const servicesPrefix = "/mesh/services/"
+
+var ErrServiceNotFound = errors.New("service not found")
 
 type Services struct {
 	kv clientv3.KV
@@ -46,6 +49,22 @@ func (s *Services) List(ctx context.Context) ([]model.ServiceConfig, error) {
 	}
 
 	return items, nil
+}
+
+func (s *Services) Get(ctx context.Context, name string) (model.ServiceConfig, error) {
+	resp, err := s.kv.Get(ctx, serviceKey(name))
+	if err != nil {
+		return model.ServiceConfig{}, err
+	}
+	if len(resp.Kvs) == 0 {
+		return model.ServiceConfig{}, ErrServiceNotFound
+	}
+
+	var cfg model.ServiceConfig
+	if err := json.Unmarshal(resp.Kvs[0].Value, &cfg); err != nil {
+		return model.ServiceConfig{}, err
+	}
+	return cfg, nil
 }
 
 func serviceKey(name string) string {

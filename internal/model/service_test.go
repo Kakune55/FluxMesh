@@ -46,6 +46,20 @@ func TestServiceConfigValidateInvalid(t *testing.T) {
 				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "svc", Weight: 101}},
 			},
 		},
+		{
+			name: "negative weight",
+			cfg: ServiceConfig{
+				Name:   "payment-svc",
+				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "svc", Weight: -1}},
+			},
+		},
+		{
+			name: "blank name",
+			cfg: ServiceConfig{
+				Name:   "   ",
+				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "svc"}},
+			},
+		},
 	}
 
 	for _, tt := range tests {

@@ -131,6 +131,7 @@ curl -s -X POST http://127.0.0.1:15000/api/v1/services \
   }' | jq .
 
 curl -s http://127.0.0.1:15000/api/v1/services | jq .
+curl -s http://127.0.0.1:15000/api/v1/services/payment-svc | jq .
 ```
 
 ### 6.3 节点驱逐
@@ -145,7 +146,7 @@ curl -s -X DELETE 'http://127.0.0.1:15000/api/v1/nodes/server-1?force=true' | jq
 
 说明：未携带 `force=true` 驱逐 leader 会返回 `409 Conflict`。
 
-### 5.3 清理
+## 7. 清理
 
 ```bash
 docker compose --profile s1a down -v
