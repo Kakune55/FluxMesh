@@ -10,6 +10,8 @@ type ServiceConfig struct {
 	Namespace string         `json:"namespace,omitempty"`
 	Version   string         `json:"version,omitempty"`
 	ResourceVersion int64    `json:"resource_version,omitempty"`
+	UpdatedAt string         `json:"updated_at,omitempty"`
+	UpdatedBy string         `json:"updated_by,omitempty"`
 	Routes    []ServiceRoute `json:"routes"`
 }
 

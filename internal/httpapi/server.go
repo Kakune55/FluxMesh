@@ -26,7 +26,7 @@ type Server struct {
 func NewServer(addr string, nodes *registry.Service, services *registry.Services, version string) *Server {
 	s := &Server{nodes: nodes, services: services, version: version}
 	mux := http.NewServeMux()
-	// MVP 仅暴露健康探针与节点拓扑查询接口。
+	// 管理接口
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/nodes", s.handleNodes)
@@ -160,6 +160,8 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		applyOperatorMetadata(&cfg, r)
+
 		if err := cfg.Validate(); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -215,6 +217,7 @@ func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg.Name = name
+		applyOperatorMetadata(&cfg, r)
 
 		if err := cfg.Validate(); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -230,7 +233,16 @@ func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
 		updated, err := s.services.UpdateWithRevision(r.Context(), name, cfg, rev)
 		if err != nil {
 			if errors.Is(err, registry.ErrServiceConflict) {
-				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+					latest, getErr := s.services.Get(r.Context(), name)
+					if getErr == nil {
+						writeJSON(w, http.StatusConflict, map[string]any{
+							"error":                    err.Error(),
+							"current_resource_version": latest.ResourceVersion,
+							"current_config":           latest,
+						})
+						return
+					}
+					writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 				return
 			}
 			if errors.Is(err, registry.ErrServiceNotFound) {
@@ -273,6 +285,17 @@ func parseExpectedRevision(r *http.Request, fallback int64) (int64, error) {
 	}
 
 	return rev, nil
+}
+
+func applyOperatorMetadata(cfg *model.ServiceConfig, r *http.Request) {
+	operator := strings.TrimSpace(r.Header.Get("X-Operator"))
+	if operator == "" {
+		operator = strings.TrimSpace(cfg.UpdatedBy)
+	}
+	if operator == "" {
+		operator = "api"
+	}
+	cfg.UpdatedBy = operator
 }
 
 func writeJSON(w http.ResponseWriter, code int, data any) {

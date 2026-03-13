@@ -123,10 +123,22 @@ func TestHandleServiceByNameCASAndDelete(t *testing.T) {
 	t.Run("put success then conflict", func(t *testing.T) {
 		bodyOK := bytes.NewBufferString(`{"name":"payment-svc","namespace":"prod","version":"v2","routes":[{"path_prefix":"/","destination":"payment-v2","weight":100}]}`)
 		reqOK := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/services/payment-svc?resource_version=%d", current.ResourceVersion), bodyOK)
+		reqOK.Header.Set("X-Operator", "qa-bot")
 		wOK := httptest.NewRecorder()
 		s.handleServiceByName(wOK, reqOK)
 		if wOK.Code != http.StatusOK {
 			t.Fatalf("expected %d, got %d", http.StatusOK, wOK.Code)
+		}
+
+		var updated model.ServiceConfig
+		if err := json.Unmarshal(wOK.Body.Bytes(), &updated); err != nil {
+			t.Fatalf("failed to decode update response: %v", err)
+		}
+		if updated.UpdatedBy != "qa-bot" {
+			t.Fatalf("expected updated_by=qa-bot, got %s", updated.UpdatedBy)
+		}
+		if updated.UpdatedAt == "" {
+			t.Fatalf("expected updated_at to be set")
 		}
 
 		bodyConflict := bytes.NewBufferString(`{"name":"payment-svc","namespace":"prod","version":"v3","routes":[{"path_prefix":"/","destination":"payment-v3","weight":100}]}`)
@@ -144,6 +156,14 @@ func TestHandleServiceByNameCASAndDelete(t *testing.T) {
 		rv, ok := conflictPayload["current_resource_version"].(float64)
 		if !ok || int64(rv) <= current.ResourceVersion {
 			t.Fatalf("expected newer current_resource_version, got %+v", conflictPayload["current_resource_version"])
+		}
+
+		cfg, ok := conflictPayload["current_config"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected current_config object in conflict payload")
+		}
+		if cfg["name"] != "payment-svc" {
+			t.Fatalf("expected current_config.name=payment-svc, got %+v", cfg["name"])
 		}
 	})
 

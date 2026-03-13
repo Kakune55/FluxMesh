@@ -121,6 +121,7 @@ curl -s http://127.0.0.1:15000/api/v1/nodes | jq .
 ```bash
 curl -s -X POST http://127.0.0.1:15000/api/v1/services \
   -H 'Content-Type: application/json' \
+  -H 'X-Operator: demo-user' \
   -d '{
     "name": "payment-svc",
     "namespace": "prod",
@@ -137,6 +138,7 @@ curl -s http://127.0.0.1:15000/api/v1/services/payment-svc | jq .
 rev=$(curl -s http://127.0.0.1:15000/api/v1/services/payment-svc | jq -r .resource_version)
 curl -s -X PUT "http://127.0.0.1:15000/api/v1/services/payment-svc?resource_version=${rev}" \
   -H 'Content-Type: application/json' \
+  -H 'X-Operator: demo-user' \
   -d '{
     "name": "payment-svc",
     "namespace": "prod",
@@ -148,6 +150,8 @@ curl -s -X PUT "http://127.0.0.1:15000/api/v1/services/payment-svc?resource_vers
 
 curl -s -X DELETE http://127.0.0.1:15000/api/v1/services/payment-svc | jq .
 ```
+
+说明：若 CAS 冲突，接口会返回 `409` 且包含 `current_resource_version` 与 `current_config`，客户端可用该值直接重试或合并后重试。
 
 ### 6.3 节点驱逐
 

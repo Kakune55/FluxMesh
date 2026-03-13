@@ -35,9 +35,16 @@ func TestServicesCASFlow(t *testing.T) {
 	if got.ResourceVersion <= 0 {
 		t.Fatalf("expected positive resource version, got %d", got.ResourceVersion)
 	}
+	if got.UpdatedAt == "" {
+		t.Fatalf("expected updated_at to be set")
+	}
+	if got.UpdatedBy == "" {
+		t.Fatalf("expected updated_by to be set")
+	}
 
 	updatedCfg := got
 	updatedCfg.Version = "v2"
+	updatedCfg.UpdatedBy = "integration-test"
 	updatedCfg.Routes = []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v2", Weight: 100}}
 	updated, err := svc.UpdateWithRevision(ctx, got.Name, updatedCfg, got.ResourceVersion)
 	if err != nil {
@@ -45,6 +52,9 @@ func TestServicesCASFlow(t *testing.T) {
 	}
 	if updated.Version != "v2" {
 		t.Fatalf("expected version v2, got %s", updated.Version)
+	}
+	if updated.UpdatedBy != "integration-test" {
+		t.Fatalf("expected updated_by integration-test, got %s", updated.UpdatedBy)
 	}
 
 	_, err = svc.UpdateWithRevision(ctx, got.Name, updatedCfg, got.ResourceVersion)

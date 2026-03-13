@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"fluxmesh/internal/model"
 
@@ -26,6 +27,7 @@ func NewServices(cli *clientv3.Client) *Services {
 
 func (s *Services) Put(ctx context.Context, cfg model.ServiceConfig) error {
 	cfg.ResourceVersion = 0
+	stampServiceAudit(&cfg)
 	payload, err := json.Marshal(cfg)
 	if err != nil {
 		return err
@@ -79,6 +81,7 @@ func (s *Services) UpdateWithRevision(ctx context.Context, name string, cfg mode
 
 	cfg.Name = name
 	cfg.ResourceVersion = 0
+	stampServiceAudit(&cfg)
 	payload, err := json.Marshal(cfg)
 	if err != nil {
 		return model.ServiceConfig{}, err
@@ -112,4 +115,11 @@ func (s *Services) Delete(ctx context.Context, name string) error {
 
 func serviceKey(name string) string {
 	return servicesPrefix + strings.TrimSpace(name)
+}
+
+func stampServiceAudit(cfg *model.ServiceConfig) {
+	cfg.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if strings.TrimSpace(cfg.UpdatedBy) == "" {
+		cfg.UpdatedBy = "system"
+	}
 }
