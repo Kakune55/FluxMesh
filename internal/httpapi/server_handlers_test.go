@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"fluxmesh/internal/model"
 	"fluxmesh/internal/registry"
+	"fluxmesh/internal/softkv"
 	"fluxmesh/internal/testutil/etcdtest"
 )
 
@@ -180,6 +182,71 @@ func TestHandleServiceByNameCASAndDelete(t *testing.T) {
 		s.handleServiceByName(wGet, reqGet)
 		if wGet.Code != http.StatusNotFound {
 			t.Fatalf("expected %d, got %d", http.StatusNotFound, wGet.Code)
+		}
+	})
+}
+
+func TestHandleSoftKV(t *testing.T) {
+	store := softkv.NewStore()
+	s := &Server{softStore: store}
+
+	_, err := store.Put(t.Context(), "metrics/nodes/node-1", map[string]any{"cpu": 12.3}, 10*time.Second, "node-1")
+	if err != nil {
+		t.Fatalf("seed softkv failed: %v", err)
+	}
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/softkv", nil)
+		w := httptest.NewRecorder()
+		s.handleSoftKV(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected %d, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+
+	t.Run("list with prefix", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/softkv?prefix=metrics/nodes/", nil)
+		w := httptest.NewRecorder()
+		s.handleSoftKV(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var items []softkv.Entry
+		if err := json.Unmarshal(w.Body.Bytes(), &items); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if len(items) != 1 {
+			t.Fatalf("expected 1 entry, got %d", len(items))
+		}
+		if items[0].Key != "metrics/nodes/node-1" {
+			t.Fatalf("unexpected key: %s", items[0].Key)
+		}
+	})
+
+	t.Run("get by encoded key", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/softkv/metrics%2Fnodes%2Fnode-1", nil)
+		w := httptest.NewRecorder()
+		s.handleSoftKVByKey(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var item softkv.Entry
+		if err := json.Unmarshal(w.Body.Bytes(), &item); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if item.Key != "metrics/nodes/node-1" {
+			t.Fatalf("unexpected key: %s", item.Key)
+		}
+	})
+
+	t.Run("get by key not found", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/softkv/missing-key", nil)
+		w := httptest.NewRecorder()
+		s.handleSoftKVByKey(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected %d, got %d", http.StatusNotFound, w.Code)
 		}
 	})
 }

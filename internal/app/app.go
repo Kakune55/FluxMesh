@@ -16,7 +16,7 @@ import (
 	"fluxmesh/internal/netutil"
 	"fluxmesh/internal/reconcile"
 	"fluxmesh/internal/registry"
-	"fluxmesh/internal/softstate"
+	"fluxmesh/internal/softkv"
 	"fluxmesh/internal/sysmetrics"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -28,7 +28,7 @@ type App struct {
 	client       *clientv3.Client
 	nodes        *registry.Service
 	services     *registry.Services
-	softStore    *softstate.Store
+	softStore    *softkv.Store
 	http         *httpapi.Server
 	reconciler   *reconcile.MemberReconciler
 	metrics      *sysmetrics.Collector
@@ -62,7 +62,7 @@ func New(cfg config.Config) (*App, error) {
 		cfg:        cfg,
 		reconciler: reconcile.NewMemberReconciler(),
 		metrics:    sysmetrics.NewCollector(),
-		softStore:  softstate.NewStore(),
+		softStore:  softkv.NewStore(),
 	}, nil
 }
 
@@ -116,7 +116,13 @@ func (a *App) Run(parent context.Context) error {
 		a.monitorNodeMetrics(ctx)
 	}()
 
-	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.services, a.cfg.Version)
+	a.backgroundWG.Add(1)
+	go func() {
+		defer a.backgroundWG.Done()
+		a.gcSoftState(ctx)
+	}()
+
+	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.services, a.softStore, a.cfg.Version)
 	return a.http.Start()
 }
 
@@ -343,6 +349,24 @@ func (a *App) currentNode() model.Node {
 	a.nodeMu.RLock()
 	defer a.nodeMu.RUnlock()
 	return a.selfNode
+}
+
+func (a *App) gcSoftState(ctx context.Context) {
+	if a.softStore == nil {
+		return
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.softStore.DeleteExpired(ctx)
+		}
+	}
 }
 
 func round2(v float64) float64 {

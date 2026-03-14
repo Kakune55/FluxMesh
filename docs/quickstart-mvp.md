@@ -160,7 +160,20 @@ curl -s -X DELETE http://127.0.0.1:15000/api/v1/services/payment-svc | jq .
 
 说明：若 CAS 冲突，接口会返回 `409` 且包含 `current_resource_version` 与 `current_config`，客户端可用该值直接重试或合并后重试。
 
-### 6.3 节点驱逐
+### 6.3 软状态观测（实验能力）
+
+```bash
+# 查询全部软状态
+curl -s http://127.0.0.1:15000/api/v1/softkv | jq .
+
+# 按前缀过滤（节点指标）
+curl -s "http://127.0.0.1:15000/api/v1/softkv?prefix=metrics/nodes/" | jq .
+
+# 按 key 精确查询（key 需 URL 编码）
+curl -s "http://127.0.0.1:15000/api/v1/softkv/metrics%2Fnodes%2Fnode-1" | jq .
+```
+
+### 6.4 节点驱逐
 
 ```bash
 # 驱逐普通节点（agent 或非 leader server）

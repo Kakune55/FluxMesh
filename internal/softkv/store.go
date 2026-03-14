@@ -1,4 +1,4 @@
-package softstate
+package softkv
 
 import (
 	"context"

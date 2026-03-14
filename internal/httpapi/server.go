@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -14,17 +15,19 @@ import (
 	"fluxmesh/internal/logx"
 	"fluxmesh/internal/model"
 	"fluxmesh/internal/registry"
+	"fluxmesh/internal/softkv"
 )
 
 type Server struct {
 	httpServer *http.Server
 	nodes      *registry.Service
 	services   *registry.Services
+	softStore  *softkv.Store
 	version    string
 }
 
-func NewServer(addr string, nodes *registry.Service, services *registry.Services, version string) *Server {
-	s := &Server{nodes: nodes, services: services, version: version}
+func NewServer(addr string, nodes *registry.Service, services *registry.Services, softStore *softkv.Store, version string) *Server {
+	s := &Server{nodes: nodes, services: services, softStore: softStore, version: version}
 	mux := http.NewServeMux()
 	// 管理接口
 	mux.HandleFunc("/health", s.handleHealth)
@@ -33,6 +36,8 @@ func NewServer(addr string, nodes *registry.Service, services *registry.Services
 	mux.HandleFunc("/api/v1/nodes/", s.handleNodeByID)
 	mux.HandleFunc("/api/v1/services", s.handleServices)
 	mux.HandleFunc("/api/v1/services/", s.handleServiceByName)
+	mux.HandleFunc("/api/v1/softkv", s.handleSoftKV)
+	mux.HandleFunc("/api/v1/softkv/", s.handleSoftKVByKey)
 
 	s.httpServer = &http.Server{
 		Addr:              addr,
@@ -268,6 +273,53 @@ func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
+}
+
+func (s *Server) handleSoftKV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.softStore == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "softkv storage not initialized"})
+		return
+	}
+
+	prefix := strings.TrimSpace(r.URL.Query().Get("prefix"))
+	items := s.softStore.List(r.Context(), prefix)
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleSoftKVByKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.softStore == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "softkv storage not initialized"})
+		return
+	}
+
+	raw := strings.TrimPrefix(r.URL.Path, "/api/v1/softkv/")
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "softkv key is required"})
+		return
+	}
+
+	key, err := url.PathUnescape(raw)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid softkv key"})
+		return
+	}
+
+	entry, ok := s.softStore.Get(r.Context(), key)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "softkv key not found"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, entry)
 }
 
 func parseExpectedRevision(r *http.Request, fallback int64) (int64, error) {
