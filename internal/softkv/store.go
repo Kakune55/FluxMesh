@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,7 +27,21 @@ type Store struct {
 	data map[string]Entry
 	seq  map[string]uint64
 	now  func() time.Time
-	stats StoreStats
+	stats storeCounters
+}
+
+type storeCounters struct {
+	putTotal          atomic.Uint64
+	putErrors         atomic.Uint64
+	getTotal          atomic.Uint64
+	getHits           atomic.Uint64
+	getMisses         atomic.Uint64
+	listTotal         atomic.Uint64
+	mergeTotal        atomic.Uint64
+	mergeAccepted     atomic.Uint64
+	mergeRejected     atomic.Uint64
+	deleteExpiredRuns atomic.Uint64
+	deleteExpiredKeys atomic.Uint64
 }
 
 type StoreStats struct {
@@ -56,19 +71,18 @@ func NewStore() *Store {
 
 func (s *Store) Put(_ context.Context, key string, value any, ttl time.Duration, sourceID string) (Entry, error) {
 	key = strings.TrimSpace(key)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.stats.PutTotal++
+	s.stats.putTotal.Add(1)
 	if key == "" {
-		s.stats.PutErrors++
+		s.stats.putErrors.Add(1)
 		return Entry{}, ErrInvalidKey
 	}
 	if ttl <= 0 {
-		s.stats.PutErrors++
+		s.stats.putErrors.Add(1)
 		return Entry{}, ErrInvalidTTL
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.seq[sourceID]++
 	now := s.now().UTC()
@@ -86,32 +100,32 @@ func (s *Store) Put(_ context.Context, key string, value any, ttl time.Duration,
 
 func (s *Store) Get(_ context.Context, key string) (Entry, bool) {
 	key = strings.TrimSpace(key)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.stats.GetTotal++
+	s.stats.getTotal.Add(1)
 	if key == "" {
-		s.stats.GetMisses++
+		s.stats.getMisses.Add(1)
 		return Entry{}, false
 	}
 
+	s.mu.RLock()
 	entry, ok := s.data[key]
+	s.mu.RUnlock()
+
 	if !ok {
-		s.stats.GetMisses++
+		s.stats.getMisses.Add(1)
 		return Entry{}, false
 	}
 	if entry.ExpiresAt <= s.now().UTC().UnixMilli() {
-		s.stats.GetMisses++
+		s.stats.getMisses.Add(1)
 		return Entry{}, false
 	}
-	s.stats.GetHits++
+	s.stats.getHits.Add(1)
 	return entry, true
 }
 
 func (s *Store) List(_ context.Context, prefix string) []Entry {
 	prefix = strings.TrimSpace(prefix)
 	nowMs := s.now().UTC().UnixMilli()
+	s.stats.listTotal.Add(1)
 
 	s.mu.RLock()
 	items := make([]Entry, 0, len(s.data))
@@ -126,10 +140,6 @@ func (s *Store) List(_ context.Context, prefix string) []Entry {
 	}
 	s.mu.RUnlock()
 
-	s.mu.Lock()
-	s.stats.ListTotal++
-	s.mu.Unlock()
-
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].Key < items[j].Key
 	})
@@ -137,24 +147,18 @@ func (s *Store) List(_ context.Context, prefix string) []Entry {
 }
 
 func (s *Store) Merge(_ context.Context, incoming Entry) bool {
+	s.stats.mergeTotal.Add(1)
 	if strings.TrimSpace(incoming.Key) == "" {
-		s.mu.Lock()
-		s.stats.MergeTotal++
-		s.stats.MergeRejected++
-		s.mu.Unlock()
+		s.stats.mergeRejected.Add(1)
 		return false
 	}
 	if incoming.ExpiresAt <= s.now().UTC().UnixMilli() {
-		s.mu.Lock()
-		s.stats.MergeTotal++
-		s.stats.MergeRejected++
-		s.mu.Unlock()
+		s.stats.mergeRejected.Add(1)
 		return false
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.stats.MergeTotal++
 
 	current, exists := s.data[incoming.Key]
 	if !exists {
@@ -162,7 +166,7 @@ func (s *Store) Merge(_ context.Context, incoming Entry) bool {
 		if incoming.SourceID != "" && incoming.Seq > s.seq[incoming.SourceID] {
 			s.seq[incoming.SourceID] = incoming.Seq
 		}
-		s.stats.MergeAccepted++
+		s.stats.mergeAccepted.Add(1)
 		return true
 	}
 
@@ -171,19 +175,19 @@ func (s *Store) Merge(_ context.Context, incoming Entry) bool {
 		if incoming.SourceID != "" && incoming.Seq > s.seq[incoming.SourceID] {
 			s.seq[incoming.SourceID] = incoming.Seq
 		}
-		s.stats.MergeAccepted++
+		s.stats.mergeAccepted.Add(1)
 		return true
 	}
-	s.stats.MergeRejected++
+	s.stats.mergeRejected.Add(1)
 	return false
 }
 
 func (s *Store) DeleteExpired(_ context.Context) int {
 	nowMs := s.now().UTC().UnixMilli()
+	s.stats.deleteExpiredRuns.Add(1)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.stats.DeleteExpiredRuns++
 
 	deleted := 0
 	for key, entry := range s.data {
@@ -192,7 +196,7 @@ func (s *Store) DeleteExpired(_ context.Context) int {
 			deleted++
 		}
 	}
-	s.stats.DeleteExpiredKeys += uint64(deleted)
+	s.stats.deleteExpiredKeys.Add(uint64(deleted))
 	return deleted
 }
 
@@ -200,7 +204,19 @@ func (s *Store) Stats() StoreStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	stats := s.stats
+	stats := StoreStats{
+		PutTotal:          s.stats.putTotal.Load(),
+		PutErrors:         s.stats.putErrors.Load(),
+		GetTotal:          s.stats.getTotal.Load(),
+		GetHits:           s.stats.getHits.Load(),
+		GetMisses:         s.stats.getMisses.Load(),
+		ListTotal:         s.stats.listTotal.Load(),
+		MergeTotal:        s.stats.mergeTotal.Load(),
+		MergeAccepted:     s.stats.mergeAccepted.Load(),
+		MergeRejected:     s.stats.mergeRejected.Load(),
+		DeleteExpiredRuns: s.stats.deleteExpiredRuns.Load(),
+		DeleteExpiredKeys: s.stats.deleteExpiredKeys.Load(),
+	}
 	stats.LiveEntries = len(s.data)
 	stats.Sources = len(s.seq)
 	stats.SnapshotAtUnixMilli = s.now().UTC().UnixMilli()
