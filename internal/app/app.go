@@ -16,6 +16,7 @@ import (
 	"fluxmesh/internal/netutil"
 	"fluxmesh/internal/reconcile"
 	"fluxmesh/internal/registry"
+	"fluxmesh/internal/softstate"
 	"fluxmesh/internal/sysmetrics"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -27,6 +28,7 @@ type App struct {
 	client       *clientv3.Client
 	nodes        *registry.Service
 	services     *registry.Services
+	softStore    *softstate.Store
 	http         *httpapi.Server
 	reconciler   *reconcile.MemberReconciler
 	metrics      *sysmetrics.Collector
@@ -60,6 +62,7 @@ func New(cfg config.Config) (*App, error) {
 		cfg:        cfg,
 		reconciler: reconcile.NewMemberReconciler(),
 		metrics:    sysmetrics.NewCollector(),
+		softStore:  softstate.NewStore(),
 	}, nil
 }
 
@@ -308,6 +311,13 @@ func (a *App) updateNodeMetrics(ctx context.Context) {
 	node.SysLoad.SystemLoad1m = round2(snapshot.SystemLoad1m)
 	node.SysLoad.SystemLoad5m = round2(snapshot.SystemLoad5m)
 	node.SysLoad.SystemLoad15m = round2(snapshot.SystemLoad15m)
+
+	if a.softStore != nil {
+		_, err := a.softStore.Put(ctx, "metrics/nodes/"+node.ID, snapshot, 30*time.Second, node.ID)
+		if err != nil {
+			logx.Warn("写入软状态指标失败", "node_id", node.ID, "err", err)
+		}
+	}
 
 	attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	err = a.nodes.UpdateNodeWithLease(attemptCtx, node, a.currentLeaseID())
