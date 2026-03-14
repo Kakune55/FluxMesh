@@ -32,6 +32,7 @@ type App struct {
 	services     *registry.Services
 	softStore    *softkv.Store
 	softBus      *softkv.Bus
+	softWriter   *softkv.Writer
 	http         *httpapi.Server
 	reconciler   *reconcile.MemberReconciler
 	metrics      *sysmetrics.Collector
@@ -61,12 +62,16 @@ func New(cfg config.Config) (*App, error) {
 		cfg.PeerAdvertiseURL = strings.Replace(cfg.PeerListenURL, "0.0.0.0", cfg.IP, 1)
 	}
 
+	store := softkv.NewStore()
+	bus := softkv.NewBus(256)
+
 	return &App{
 		cfg:        cfg,
 		reconciler: reconcile.NewMemberReconciler(),
 		metrics:    sysmetrics.NewCollector(),
-		softStore:  softkv.NewStore(),
-		softBus:    softkv.NewBus(256),
+		softStore:  store,
+		softBus:    bus,
+		softWriter: softkv.NewWriter(store, bus),
 	}, nil
 }
 
@@ -322,43 +327,30 @@ func (a *App) updateNodeMetrics(ctx context.Context) {
 	}
 
 	node := a.currentNode()
-	node.SysLoad.CPUUsage = round2(snapshot.CPUUsage)
-	node.SysLoad.MemoryUsage = round2(snapshot.MemoryUsage)
-	node.SysLoad.SystemLoad1m = round2(snapshot.SystemLoad1m)
-	node.SysLoad.SystemLoad5m = round2(snapshot.SystemLoad5m)
-	node.SysLoad.SystemLoad15m = round2(snapshot.SystemLoad15m)
+	snapshot.CPUUsage = round2(snapshot.CPUUsage)
+	snapshot.MemoryUsage = round2(snapshot.MemoryUsage)
+	snapshot.SystemLoad1m = round2(snapshot.SystemLoad1m)
+	snapshot.SystemLoad5m = round2(snapshot.SystemLoad5m)
+	snapshot.SystemLoad15m = round2(snapshot.SystemLoad15m)
 
 	if a.softStore != nil {
-		entry, err := a.softStore.Put(ctx, "metrics/nodes/"+node.ID, snapshot, 30*time.Second, node.ID)
+		if a.softWriter == nil {
+			a.softWriter = softkv.NewWriter(a.softStore, a.softBus)
+		}
+
+		result, err := a.softWriter.Write(ctx, "metrics/nodes/"+node.ID, snapshot, 30*time.Second, node.ID)
 		if err != nil {
 			logx.Warn("写入软状态指标失败", "node_id", node.ID, "err", err)
-		} else if a.softBus != nil {
-			pubCtx, pubCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-			pubErr := a.softBus.Publish(pubCtx, softkv.Event{Type: softkv.EventPut, Entry: entry})
-			pubCancel()
-			if pubErr != nil {
-				logx.Debug("发布 softkv 事件失败", "node_id", node.ID, "err", pubErr)
-			}
+		} else if result.PublishErr != nil {
+			logx.Debug("发布 softkv 事件失败", "node_id", node.ID, "err", result.PublishErr)
 		}
 	}
 
-	attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err = a.nodes.UpdateNodeWithLease(attemptCtx, node, a.currentLeaseID())
-	cancel()
-	if err != nil {
-		logx.Warn("回写节点指标失败", "node_id", node.ID, "err", err)
-		return
-	}
-
-	a.nodeMu.Lock()
-	a.selfNode = node
-	a.nodeMu.Unlock()
-
 	logx.Debug("节点指标已更新",
 		"node_id", node.ID,
-		"cpu_usage", node.SysLoad.CPUUsage,
-		"memory_usage", node.SysLoad.MemoryUsage,
-		"system_load_1m", node.SysLoad.SystemLoad1m,
+		"cpu_usage", snapshot.CPUUsage,
+		"memory_usage", snapshot.MemoryUsage,
+		"system_load_1m", snapshot.SystemLoad1m,
 	)
 }
 

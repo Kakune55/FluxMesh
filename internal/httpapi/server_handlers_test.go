@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -249,4 +250,65 @@ func TestHandleSoftKV(t *testing.T) {
 			t.Fatalf("expected %d, got %d", http.StatusNotFound, w.Code)
 		}
 	})
+}
+
+func TestHandleNodesAttachSysLoadFromSoftKV(t *testing.T) {
+	emb := etcdtest.Start(t)
+	nodesSvc := registry.NewService(emb.Client)
+	store := softkv.NewStore()
+	s := &Server{nodes: nodesSvc, softStore: store}
+
+	node := model.Node{
+		ID:      "node-a",
+		IP:      "10.0.0.1",
+		Version: "v1.0.0",
+		NodeStatus: model.NodeStatus{
+			NodeRole:   "agent",
+			NodeStatus: "Ready",
+		},
+	}
+
+	keepAliveCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	if _, _, err := nodesSvc.RegisterWithLease(t.Context(), keepAliveCtx, node, 30); err != nil {
+		t.Fatalf("register node failed: %v", err)
+	}
+
+	_, err := store.Put(t.Context(), "metrics/nodes/node-a", map[string]any{
+		"CPUUsage":      12.34,
+		"MemoryUsage":   56.78,
+		"SystemLoad1m":  0.9,
+		"SystemLoad5m":  0.7,
+		"SystemLoad15m": 0.5,
+	}, 30*time.Second, "node-a")
+	if err != nil {
+		t.Fatalf("seed softkv failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil)
+	w := httptest.NewRecorder()
+	s.handleNodes(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected %d, got %d", http.StatusOK, w.Code)
+	}
+
+	var nodes []model.Node
+	if err := json.Unmarshal(w.Body.Bytes(), &nodes); err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+
+	if nodes[0].ID != "node-a" {
+		t.Fatalf("unexpected node id: %s", nodes[0].ID)
+	}
+	if nodes[0].SysLoad.CPUUsage != 12.34 {
+		t.Fatalf("expected cpu_usage=12.34, got %v", nodes[0].SysLoad.CPUUsage)
+	}
+	if nodes[0].SysLoad.MemoryUsage != 56.78 {
+		t.Fatalf("expected memory_usage=56.78, got %v", nodes[0].SysLoad.MemoryUsage)
+	}
 }

@@ -1,163 +1,151 @@
-# FluxMesh 软状态 KV 与 Gossip 扩展设计方案
+# FluxMesh SoftKV 架构白皮书（最终版）
 
-版本：draft-v1（2026-03）
+版本：v1.0（2026-03-14）
 
-## 1. 目标与背景
+## 1. 摘要
 
-当前控制面把关键配置与拓扑信息放在 etcd（强一致）中，适合服务配置、成员治理等控制数据。
+SoftKV 是 FluxMesh 控制面的软状态平面，用于承载高频、可丢、最终一致的数据（当前以节点监控指标为主）。
 
-但有一类数据不适合持续写 etcd：
+最终方案采用：
 
-- 高频更新（如节点监控、瞬时负载）
-- 可容忍短暂延迟
-- 可容忍少量丢失
-- 读写密集，以最终一致为主
+- 本地内存 KV（TTL + 合并规则）
+- memberlist Gossip 增量扩散
+- 管理面 API 聚合输出
+- 强一致/弱一致分层边界
 
-本方案引入“软状态存储层（Soft State Store）”，使用内存 KV + Gossip 扩散，形成与 etcd 并行的弱一致状态面。
+其中 etcd 继续承载强一致控制数据，SoftKV 不替代 etcd。
 
-## 2. 设计原则
+## 2. 设计目标
 
-- 分层存储：强一致控制数据继续走 etcd，软状态走内存 KV。
-- 最终一致：不追求每次写入全局强同步。
-- 可丢可覆盖：新一轮采样可覆盖旧值。
-- 本地优先：读本地内存，降低依赖链路与延迟。
-- 反熵修复：周期摘要同步，修补丢包造成的不一致。
+- 降低 etcd 写压：不再把高频 sys_load 周期回写到 etcd。
+- 保持可观测性：`/api/v1/nodes` 仍可返回完整节点视图。
+- 保持简洁实现：接口薄、链路短、失败可退化。
+- 最终一致：允许短暂差异，不追求线性一致。
 
-## 3. 适用与不适用数据
+## 3. 设计边界
 
-### 3.1 适用
+适用：
 
-- 节点 CPU/内存/Load 指标
-- 临时健康评分
-- 高频统计计数（QPS、错误率快照）
+- 节点 CPU/内存/load 等高频监控快照
+- 临时统计或可覆盖状态
 
-### 3.2 不适用
+不适用：
 
-- 服务路由配置
-- 节点角色与成员管理
-- 需要审计与严格版本控制的控制命令
+- 服务配置与路由策略
+- 节点成员治理与角色变更
+- 需要审计和强一致保障的数据
 
-## 4. 架构概览
+边界原则：
 
-新增组件：
+- 强一致控制数据 -> etcd
+- 高频软状态数据 -> SoftKV
 
-- SoftStore：本地内存 KV（带 TTL 与版本元数据）
-- GossipBus：增量广播通道
-- AntiEntropy：周期摘要对账与补发
+## 4. 组件与职责
 
-数据流：
+### 4.1 Store
 
-1. 本地采集器写入 SoftStore
-2. Store 生成更新事件，进入广播队列
-3. Gossip 扩散到其他节点
-4. 远端节点按合并规则落本地 Store
-5. 周期反熵任务修复遗漏
+`internal/softkv/store.go`
 
-## 5. 数据模型建议
+- 负责本地 KV 存储
+- `Put/Get/List/Merge/DeleteExpired`
+- 支持 TTL 与过期回收
 
-```go
-type SoftEntry struct {
-    Key       string
-    Value     any
-    SourceID  string
-    Seq       uint64
-    UpdatedAt int64
-    ExpiresAt int64
-}
-```
+### 4.2 Bus
 
-字段语义：
+`internal/softkv/bus.go`
 
-- SourceID：产生该数据的节点 ID
-- Seq：同 SourceID 下的单调递增序列
-- UpdatedAt：UTC 毫秒时间戳（辅助排序）
-- ExpiresAt：TTL 过期时间
+- 负责事件通道抽象（发布/订阅）
+- 与存储解耦，便于测试与替换
 
-## 6. 合并与冲突策略
+### 4.3 Writer（写入封装）
 
-推荐顺序：
+`internal/softkv/writer.go`
 
-1. 优先比较 SourceID 相同情况下的 Seq（更大者覆盖）
-2. SourceID 不同且语义允许时，使用 UpdatedAt（LWW）
-3. 若业务 key 要求按来源隔离，可使用 key=metric/{source}/{name}
+- 一次调用完成 `Put + Publish`
+- 保留“写入成功但广播失败”的可观测语义
+- 业务侧调用更简洁
 
-说明：仅用时间戳会受时钟漂移影响，因此 SourceID+Seq 是主判据。
+### 4.4 Memberlist 传输层
 
-## 7. 协议与传播策略
+`internal/softkv/memberlist.go`
 
-### 7.1 增量广播
+- Gossip 广播增量事件
+- 接收远端事件并合并到本地 Store
+- 广播不可用时支持降级回环（loopback）
 
-- 事件类型：Put/Expire
-- 批处理窗口：100-300ms（减少广播风暴）
-- 单消息大小限制：建议 < 8KB
+## 5. 数据模型
 
-### 7.2 反熵同步
+SoftKV 条目核心字段：
 
-- 周期：5-10 秒
-- 方式：摘要对比（key + version）
-- 差异补发：按缺失或版本落后补齐
+- `key`: 逻辑键（例如 `metrics/nodes/server-1`）
+- `value`: 任意值（当前为指标快照）
+- `source_id`: 来源节点
+- `seq`: 单来源递增版本
+- `updated_at`: 更新时间（毫秒）
+- `expires_at`: 过期时间（毫秒）
 
-## 8. 生命周期与资源控制
+## 6. 一致性与合并规则
 
-- TTL GC：每 1 秒回收过期项
-- 最大键数：超过阈值时按过期优先 + 最久未更新淘汰
-- 速率限制：对同 key 高频写做节流与覆盖
+- 同 `source_id` 下，`seq` 更大者覆盖。
+- 无序到达或重复消息通过 `Merge` 自然收敛。
+- 以最终一致为目标，不保证严格时序。
 
-## 9. 接口建议（内部）
+## 7. 端到端工作流
 
-```go
-type SoftStore interface {
-    Put(ctx context.Context, key string, value any, ttl time.Duration, sourceID string) (SoftEntry, error)
-    Get(ctx context.Context, key string) (SoftEntry, bool)
-    List(ctx context.Context, prefix string) []SoftEntry
-    Merge(ctx context.Context, entry SoftEntry) bool
-}
-```
+### 7.1 写入链路（当前主路径）
 
-说明：Merge 返回 bool，表示是否接受并更新本地状态，便于统计收敛率。
+1. 采集器在本地周期生成指标快照。
+2. App 调用 `Writer.Write(...)` 写入 `metrics/nodes/{nodeID}`。
+3. `Writer` 内部 `Put` 成功后尝试 `Publish`。
+4. 本地节点可立即读到新值。
 
-## 10. 与现有控制面的集成建议
+### 7.2 扩散链路
 
-第一阶段（最小可用）：
+1. 事件进入 memberlist 广播队列。
+2. 其他节点收到消息后调用 `Store.Merge`。
+3. 各节点逐步收敛到相近视图。
 
-- 仅把节点指标写入 SoftStore
-- API 读取优先 SoftStore，缺失回退 etcd
-- 不改现有 etcd 指标写回逻辑（双写观察）
+### 7.3 读取链路
 
-第二阶段（降负载）：
+- `GET /api/v1/softkv`：原始软状态视图。
+- `GET /api/v1/nodes`：
+    - 基础节点信息来自 etcd。
+    - `sys_load` 由 SoftKV 聚合填充。
 
-- 指标主路径迁到 SoftStore
-- etcd 仅保留低频摘要字段
+## 8. 故障与退化策略
 
-第三阶段（稳定优化）：
+- Gossip 启动失败：回退 loopback，单节点仍可用。
+- Publish 失败：不影响本地写入成功，错误可观测。
+- 节点重启：软状态可丢，后续采样会重新覆盖。
 
-- 引入反熵摘要同步
-- 增加收敛指标与丢包率观测
+## 9. 当前实现状态
 
-## 11. 故障场景与预期
+已完成：
 
-- 单节点短时网络分区：本地读写不受影响，恢复后靠反熵收敛
-- 广播丢包：下一轮增量或反熵补齐
-- 节点重启：重新加入后同步热数据（非持久）
+- SoftKV Store（TTL + Merge + GC）
+- Bus 抽象与 Writer 薄封装
+- memberlist 广播接入
+- `/api/v1/softkv` 查询接口
+- `/api/v1/nodes` 的 `sys_load` 迁移到 SoftKV
+- 关键单测与集成验证
 
-## 12. 风险与边界
+未完成（下一阶段）：
 
-- 软状态非持久，重启会丢；这是可接受前提。
-- Gossip 扩散不是严格时序，消费者必须容忍乱序。
-- 不应把策略配置等强一致数据误放入本层。
+- 反熵同步（Anti-Entropy）
+- SoftKV 专项可观测指标（丢包率/收敛延迟）
+- 更细粒度流控与限速
 
-## 13. 验收标准
+## 10. 运维建议
 
-- 100ms-1s 内指标在多数节点可见
-- 单次丢包不影响下一轮覆盖
-- 10s 内跨节点指标收敛率达到预期阈值（如 >95%）
-- etcd 写压显著下降（相较全量指标写入）
+- 使用三节点及以上部署 Gossip，避免单点视角偏差。
+- 优先观察 `metrics/nodes/` 前缀键的更新与过期行为。
+- 把 SoftKV 视为“实时快照层”，不要用于审计回溯。
 
-## 14. 开发任务拆分（建议）
+## 11. 结论
 
-1. 建立 SoftStore（map + TTL + merge）
-2. 建立 GossipBus 抽象（先本地 mock）【已完成：loopback 事件总线】
-3. 对接 sysmetrics 写入 SoftStore
-4. 增加状态查询 API（仅观测）
-5. 接入真实 memberlist 广播
-6. 增加 AntiEntropy 与回归测试
+SoftKV 最终版架构已形成稳定分层：
+
+- etcd 负责“控制正确性”
+- SoftKV 负责“状态实时性”
+
+该分层在保持控制面一致性的同时，显著降低了高频监控数据对强一致存储的压力，并为后续反熵与更大规模扩展留出了演进空间。

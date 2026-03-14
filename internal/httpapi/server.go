@@ -79,7 +79,70 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	nodes = s.attachNodeMetricsFromSoftKV(r.Context(), nodes)
 	writeJSON(w, http.StatusOK, nodes)
+}
+
+func (s *Server) attachNodeMetricsFromSoftKV(ctx context.Context, nodes []model.Node) []model.Node {
+	if s.softStore == nil || len(nodes) == 0 {
+		return nodes
+	}
+
+	entries := s.softStore.List(ctx, "metrics/nodes/")
+	if len(entries) == 0 {
+		return nodes
+	}
+
+	metricByNode := make(map[string]model.SysLoad, len(entries))
+	for _, entry := range entries {
+		nodeID := strings.TrimSpace(strings.TrimPrefix(entry.Key, "metrics/nodes/"))
+		if nodeID == "" {
+			nodeID = strings.TrimSpace(entry.SourceID)
+		}
+		if nodeID == "" {
+			continue
+		}
+
+		load, ok := decodeSysLoadFromValue(entry.Value)
+		if !ok {
+			continue
+		}
+		metricByNode[nodeID] = load
+	}
+
+	for i := range nodes {
+		if load, ok := metricByNode[nodes[i].ID]; ok {
+			nodes[i].SysLoad = load
+		}
+	}
+
+	return nodes
+}
+
+func decodeSysLoadFromValue(value any) (model.SysLoad, bool) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return model.SysLoad{}, false
+	}
+
+	var payload struct {
+		CPUUsage      float64 `json:"CPUUsage"`
+		MemoryUsage   float64 `json:"MemoryUsage"`
+		SystemLoad1m  float64 `json:"SystemLoad1m"`
+		SystemLoad5m  float64 `json:"SystemLoad5m"`
+		SystemLoad15m float64 `json:"SystemLoad15m"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return model.SysLoad{}, false
+	}
+
+	return model.SysLoad{
+		CPUUsage:      payload.CPUUsage,
+		MemoryUsage:   payload.MemoryUsage,
+		SystemLoad1m:  payload.SystemLoad1m,
+		SystemLoad5m:  payload.SystemLoad5m,
+		SystemLoad15m: payload.SystemLoad15m,
+	}, true
 }
 
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
