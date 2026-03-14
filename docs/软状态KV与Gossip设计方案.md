@@ -156,7 +156,7 @@ type SoftStore interface {
 ## 14. 开发任务拆分（建议）
 
 1. 建立 SoftStore（map + TTL + merge）
-2. 建立 GossipBus 抽象（先本地 mock）
+2. 建立 GossipBus 抽象（先本地 mock）【已完成：loopback 事件总线】
 3. 对接 sysmetrics 写入 SoftStore
 4. 增加状态查询 API（仅观测）
 5. 接入真实 memberlist 广播

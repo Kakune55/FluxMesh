@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ type App struct {
 	nodes        *registry.Service
 	services     *registry.Services
 	softStore    *softkv.Store
+	softBus      *softkv.Bus
 	http         *httpapi.Server
 	reconciler   *reconcile.MemberReconciler
 	metrics      *sysmetrics.Collector
@@ -63,6 +66,7 @@ func New(cfg config.Config) (*App, error) {
 		reconciler: reconcile.NewMemberReconciler(),
 		metrics:    sysmetrics.NewCollector(),
 		softStore:  softkv.NewStore(),
+		softBus:    softkv.NewBus(256),
 	}, nil
 }
 
@@ -120,6 +124,12 @@ func (a *App) Run(parent context.Context) error {
 	go func() {
 		defer a.backgroundWG.Done()
 		a.gcSoftState(ctx)
+	}()
+
+	a.backgroundWG.Add(1)
+	go func() {
+		defer a.backgroundWG.Done()
+		a.runSoftKVBus(ctx)
 	}()
 
 	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.services, a.softStore, a.cfg.Version)
@@ -319,9 +329,16 @@ func (a *App) updateNodeMetrics(ctx context.Context) {
 	node.SysLoad.SystemLoad15m = round2(snapshot.SystemLoad15m)
 
 	if a.softStore != nil {
-		_, err := a.softStore.Put(ctx, "metrics/nodes/"+node.ID, snapshot, 30*time.Second, node.ID)
+		entry, err := a.softStore.Put(ctx, "metrics/nodes/"+node.ID, snapshot, 30*time.Second, node.ID)
 		if err != nil {
 			logx.Warn("写入软状态指标失败", "node_id", node.ID, "err", err)
+		} else if a.softBus != nil {
+			pubCtx, pubCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			pubErr := a.softBus.Publish(pubCtx, softkv.Event{Type: softkv.EventPut, Entry: entry})
+			pubCancel()
+			if pubErr != nil {
+				logx.Debug("发布 softkv 事件失败", "node_id", node.ID, "err", pubErr)
+			}
 		}
 	}
 
@@ -367,6 +384,54 @@ func (a *App) gcSoftState(ctx context.Context) {
 			a.softStore.DeleteExpired(ctx)
 		}
 	}
+}
+
+func (a *App) runSoftKVBus(ctx context.Context) {
+	if a.softStore == nil || a.softBus == nil {
+		return
+	}
+
+	peers := a.discoverGossipPeers(ctx)
+	err := softkv.RunMemberlist(ctx, a.softStore, a.softBus.Subscribe(), softkv.MemberlistOptions{
+		NodeID:        a.cfg.NodeID,
+		AdvertiseAddr: a.cfg.IP,
+		BindPort:      softkv.DefaultGossipPort,
+		Join:          peers,
+	})
+	if err != nil {
+		logx.Warn("softkv gossip 启动失败，回退 loopback", "err", err)
+		softkv.RunLoopback(ctx, a.softStore, a.softBus.Subscribe())
+	}
+}
+
+func (a *App) discoverGossipPeers(ctx context.Context) []string {
+	if a.nodes == nil {
+		return nil
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	nodes, err := a.nodes.ListNodes(listCtx)
+	if err != nil {
+		logx.Debug("读取节点列表用于 gossip join 失败", "err", err)
+		return nil
+	}
+
+	peers := make([]string, 0, len(nodes))
+	seen := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		if node.ID == a.cfg.NodeID || strings.TrimSpace(node.IP) == "" {
+			continue
+		}
+		addr := net.JoinHostPort(node.IP, strconv.Itoa(softkv.DefaultGossipPort))
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		peers = append(peers, addr)
+	}
+	return peers
 }
 
 func round2(v float64) float64 {
