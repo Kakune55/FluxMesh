@@ -37,6 +37,7 @@ func NewServer(addr string, nodes *registry.Service, services *registry.Services
 	mux.HandleFunc("/api/v1/services", s.handleServices)
 	mux.HandleFunc("/api/v1/services/", s.handleServiceByName)
 	mux.HandleFunc("/api/v1/softkv", s.handleSoftKV)
+	mux.HandleFunc("/api/v1/softkv/stats", s.handleSoftKVStats)
 	mux.HandleFunc("/api/v1/softkv/", s.handleSoftKVByKey)
 
 	s.httpServer = &http.Server{
@@ -351,6 +352,19 @@ func (s *Server) handleSoftKV(w http.ResponseWriter, r *http.Request) {
 	prefix := strings.TrimSpace(r.URL.Query().Get("prefix"))
 	items := s.softStore.List(r.Context(), prefix)
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleSoftKVStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.softStore == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "softkv storage not initialized"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, s.softStore.Stats())
 }
 
 func (s *Server) handleSoftKVByKey(w http.ResponseWriter, r *http.Request) {

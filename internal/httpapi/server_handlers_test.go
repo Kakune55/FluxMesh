@@ -250,6 +250,26 @@ func TestHandleSoftKV(t *testing.T) {
 			t.Fatalf("expected %d, got %d", http.StatusNotFound, w.Code)
 		}
 	})
+
+	t.Run("stats", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/softkv/stats", nil)
+		w := httptest.NewRecorder()
+		s.handleSoftKVStats(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var stats softkv.StoreStats
+		if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if stats.PutTotal == 0 {
+			t.Fatalf("expected put_total > 0, got %d", stats.PutTotal)
+		}
+		if stats.LiveEntries == 0 {
+			t.Fatalf("expected live_entries > 0, got %d", stats.LiveEntries)
+		}
+	})
 }
 
 func TestHandleNodesAttachSysLoadFromSoftKV(t *testing.T) {

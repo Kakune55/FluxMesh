@@ -171,6 +171,9 @@ curl -s "http://127.0.0.1:15000/api/v1/softkv?prefix=metrics/nodes/" | jq .
 
 # 按 key 精确查询（key 需 URL 编码）
 curl -s "http://127.0.0.1:15000/api/v1/softkv/metrics%2Fnodes%2Fnode-1" | jq .
+
+# 查询 softkv 运行统计（用于收敛/丢失趋势观测）
+curl -s "http://127.0.0.1:15000/api/v1/softkv/stats" | jq .
 ```
 
 ### 6.4 节点驱逐
