@@ -55,6 +55,32 @@ func TestStoreMerge(t *testing.T) {
 	}
 }
 
+func TestStoreMergeRejectsIngestedAtOnlyChange(t *testing.T) {
+	s := NewStore()
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	base := Entry{
+		Key:        "k-ingested",
+		Value:      "v1",
+		SourceID:   "n1",
+		Seq:        7,
+		UpdatedAt:  now.UnixMilli(),
+		ExpiresAt:  now.Add(10 * time.Second).UnixMilli(),
+		IngestedAt: now.UnixMilli(),
+	}
+	if !s.Merge(ctx, base) {
+		t.Fatalf("expected first merge accepted")
+	}
+
+	// Same version payload except a different ingest timestamp must be rejected.
+	replayed := base
+	replayed.IngestedAt = now.Add(3 * time.Second).UnixMilli()
+	if s.Merge(ctx, replayed) {
+		t.Fatalf("expected replay with ingested_at-only change rejected")
+	}
+}
+
 func TestStoreDeleteExpired(t *testing.T) {
 	s := NewStore()
 	ctx := context.Background()

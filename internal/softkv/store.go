@@ -20,6 +20,7 @@ type Entry struct {
 	Seq       uint64 `json:"seq"`
 	UpdatedAt int64  `json:"updated_at"`
 	ExpiresAt int64  `json:"expires_at"`
+	IngestedAt int64 `json:"ingested_at"`
 }
 
 type Store struct {
@@ -93,6 +94,7 @@ func (s *Store) Put(_ context.Context, key string, value any, ttl time.Duration,
 		Seq:       s.seq[sourceID],
 		UpdatedAt: now.UnixMilli(),
 		ExpiresAt: now.Add(ttl).UnixMilli(),
+		IngestedAt: now.UnixMilli(),
 	}
 	s.data[key] = entry
 	return entry, nil
@@ -161,6 +163,7 @@ func (s *Store) Merge(_ context.Context, incoming Entry) bool {
 	defer s.mu.Unlock()
 
 	current, exists := s.data[incoming.Key]
+	incoming.IngestedAt = s.now().UTC().UnixMilli()
 	if !exists {
 		s.data[incoming.Key] = incoming
 		if incoming.SourceID != "" && incoming.Seq > s.seq[incoming.SourceID] {
