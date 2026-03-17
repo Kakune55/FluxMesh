@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"fluxmesh/internal/logx"
 
@@ -16,6 +17,11 @@ import (
 )
 
 const DefaultGossipPort = 7946
+
+const (
+	joinRetryMinInterval = 5 * time.Second
+	joinRetryMaxInterval = 60 * time.Second
+)
 
 type MemberlistOptions struct {
 	NodeID        string
@@ -28,6 +34,10 @@ type MemberlistOptions struct {
 type gossipMessage struct {
 	Sender string `json:"sender"`
 	Event  Event  `json:"event"`
+}
+
+type gossipState struct {
+	Entries []Entry `json:"entries"`
 }
 
 type gossipDelegate struct {
@@ -68,10 +78,32 @@ func (d *gossipDelegate) GetBroadcasts(overhead, limit int) [][]byte {
 }
 
 func (d *gossipDelegate) LocalState(bool) []byte {
-	return nil
+	if d.store == nil {
+		return nil
+	}
+
+	state := gossipState{Entries: d.store.List(context.Background(), "")}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
-func (d *gossipDelegate) MergeRemoteState([]byte, bool) {
+func (d *gossipDelegate) MergeRemoteState(raw []byte, _ bool) {
+	if d.store == nil || len(raw) == 0 {
+		return
+	}
+
+	var state gossipState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return
+	}
+
+	ctx := context.Background()
+	for _, entry := range state.Entries {
+		d.store.Merge(ctx, entry)
+	}
 }
 
 type gossipBroadcast struct {
@@ -140,16 +172,36 @@ func RunMemberlist(ctx context.Context, store *Store, events <-chan Event, opts 
 	delegate.queue = queue
 
 	joinTargets := normalizeJoinTargets(opts.Join, opts.BindPort)
+	joinRetryInterval := joinRetryMinInterval
 	if len(joinTargets) > 0 {
 		if _, err := ml.Join(joinTargets); err != nil {
 			logx.Warn("softkv gossip join 失败，先以单节点模式运行", "err", err, "targets", strings.Join(joinTargets, ","))
+			joinRetryInterval = nextJoinRetryInterval(joinRetryInterval, false)
+		} else {
+			joinRetryInterval = joinRetryMinInterval
 		}
 	}
 
+	joinTicker := time.NewTicker(joinRetryInterval)
+	defer joinTicker.Stop()
+
 	for {
+		joinTick := joinTicker.C
+		if len(joinTargets) == 0 {
+			joinTick = nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-joinTick:
+			if _, err := ml.Join(joinTargets); err != nil {
+				logx.Warn("softkv gossip 定时 join 失败，稍后重试", "err", err, "targets", strings.Join(joinTargets, ","), "retry_in", joinRetryInterval.String())
+				joinRetryInterval = nextJoinRetryInterval(joinRetryInterval, false)
+			} else {
+				joinRetryInterval = nextJoinRetryInterval(joinRetryInterval, true)
+			}
+			joinTicker.Reset(joinRetryInterval)
 		case event := <-events:
 			if event.Type != EventPut {
 				continue
@@ -163,6 +215,25 @@ func RunMemberlist(ctx context.Context, store *Store, events <-chan Event, opts 
 			queue.QueueBroadcast(&gossipBroadcast{msg: raw})
 		}
 	}
+}
+
+func nextJoinRetryInterval(current time.Duration, success bool) time.Duration {
+	if success {
+		return joinRetryMinInterval
+	}
+
+	if current <= 0 {
+		return joinRetryMinInterval
+	}
+
+	next := current * 2
+	if next < joinRetryMinInterval {
+		return joinRetryMinInterval
+	}
+	if next > joinRetryMaxInterval {
+		return joinRetryMaxInterval
+	}
+	return next
 }
 
 func encodeGossipMessage(nodeID string, event Event) ([]byte, error) {

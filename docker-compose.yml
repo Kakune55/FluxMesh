@@ -31,7 +31,7 @@ services:
     #   - ./data/docker/server-1:/data
     networks:
       - fluxmesh
-    profiles: ["s1a", "3s"]
+    profiles: ["s1a", "3s", "scale"]
 
   # profile: s1a
   agent-1:
@@ -80,7 +80,7 @@ services:
     #   - ./data/docker/server-2:/data
     networks:
       - fluxmesh
-    profiles: ["3s"]
+    profiles: ["3s", "scale"]
 
   # profile: 3s
   server-3:
@@ -111,7 +111,30 @@ services:
     #   - ./data/docker/server-3:/data
     networks:
       - fluxmesh
-    profiles: ["3s"]
+    profiles: ["3s", "scale"]
+
+  # profile: scale
+  # 使用 --scale agent-scale=N 启动大规模 agent 压测。
+  # 通过容器主机名保证每个副本 node-id 唯一；IP 使用 auto 以保证可直连。
+  agent-scale:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - exec fluxmesh --role=agent --node-id="$${HOSTNAME}" --ip=auto --seed-endpoints=http://server-1:2379,http://server-2:2379,http://server-3:2379 --admin-addr=:15000
+    depends_on:
+      server-1:
+        condition: service_healthy
+      server-2:
+        condition: service_started
+      server-3:
+        condition: service_started
+    restart: on-failure
+    networks:
+      - fluxmesh
+    profiles: ["scale"]
 
 networks:
   fluxmesh:

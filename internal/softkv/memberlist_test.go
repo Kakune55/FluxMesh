@@ -7,6 +7,26 @@ import (
 	"time"
 )
 
+func TestNextJoinRetryIntervalBackoffAndCap(t *testing.T) {
+	if got := nextJoinRetryInterval(0, false); got != joinRetryMinInterval {
+		t.Fatalf("expected min interval for zero current, got=%s", got)
+	}
+
+	if got := nextJoinRetryInterval(joinRetryMinInterval, false); got != 10*time.Second {
+		t.Fatalf("expected 10s after first backoff, got=%s", got)
+	}
+
+	if got := nextJoinRetryInterval(joinRetryMaxInterval, false); got != joinRetryMaxInterval {
+		t.Fatalf("expected capped max interval, got=%s", got)
+	}
+}
+
+func TestNextJoinRetryIntervalResetOnSuccess(t *testing.T) {
+	if got := nextJoinRetryInterval(40*time.Second, true); got != joinRetryMinInterval {
+		t.Fatalf("expected reset to min on success, got=%s", got)
+	}
+}
+
 func TestEncodeDecodeGossipMessage(t *testing.T) {
 	original := Event{
 		Type: EventPut,
@@ -100,6 +120,34 @@ func TestGossipDelegateNotifyMsgMerge(t *testing.T) {
 	}
 	if entry.Seq != 999 {
 		t.Fatalf("expected seq=999, got %d", entry.Seq)
+	}
+}
+
+func TestGossipDelegateLocalStateMergeRemoteState(t *testing.T) {
+	source := NewStore()
+	sink := NewStore()
+
+	ctx := context.Background()
+	_, err := source.Put(ctx, "metrics/nodes/node-a", map[string]any{"cpu": 11.0}, 10*time.Second, "node-a")
+	if err != nil {
+		t.Fatalf("source put failed: %v", err)
+	}
+
+	srcDelegate := &gossipDelegate{store: source, nodeID: "node-a"}
+	raw := srcDelegate.LocalState(false)
+	if len(raw) == 0 {
+		t.Fatal("expected local state payload")
+	}
+
+	sinkDelegate := &gossipDelegate{store: sink, nodeID: "node-b"}
+	sinkDelegate.MergeRemoteState(raw, false)
+
+	entry, ok := sink.Get(ctx, "metrics/nodes/node-a")
+	if !ok {
+		t.Fatal("expected merged entry in sink store")
+	}
+	if entry.SourceID != "node-a" {
+		t.Fatalf("unexpected source id: %s", entry.SourceID)
 	}
 }
 
