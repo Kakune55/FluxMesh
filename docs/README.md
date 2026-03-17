@@ -1,15 +1,17 @@
-# FluxMesh 文档导航
+# FluxMesh Documentation
 
-## 推荐阅读顺序
+Welcome to the official FluxMesh documentation. Here you will find guides, architecture overviews, and detailed design documents to help you understand and use FluxMesh.
 
-1. 控制面白皮书：整体架构、边界与路线
-2. MVP 快速启动：部署、联调、验证
-3. 控制面设计：历史演进与实现细节
-4. SoftKV 架构白皮书：软状态平面最终方案
+## Table of Contents (Chinese)
 
-## 文档列表
+### Getting Started
+* [快速开始 (Getting Started)](zh/getting-started.md)
 
-- 控制面白皮书：控制面白皮书.md
-- MVP 快速启动：quickstart-mvp.md
-- 控制面设计细节：控制面设计.md
-- SoftKV 架构白皮书（最终版）：软状态KV与Gossip设计方案.md
+### Architecture / 架构设计
+* [控制面白皮书 (Control Plane Whitepaper)](zh/architecture/control-plane-whitepaper.md)
+* [控制面设计 (Control Plane Design)](zh/architecture/control-plane-design.md)
+* [控制面架构图 (Control Plane Architecture Diagram)](zh/architecture/control-plane-architecture.drawio)
+
+### Design Documents / 详细设计方案
+* [软状态KV与Gossip设计方案 (Soft-state KV and Gossip Design)](zh/design/soft-kv-and-gossip.md)
+
