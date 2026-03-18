@@ -14,4 +14,5 @@ Welcome to the official FluxMesh documentation. Here you will find guides, archi
 
 ### Design Documents / 详细设计方案
 * [软状态KV与Gossip设计方案 (Soft-state KV and Gossip Design)](zh/design/soft-kv-and-gossip.md)
+* [流量面MVP设计草案 (Traffic Plane MVP Draft)](zh/design/traffic-plane-mvp.md)
 
