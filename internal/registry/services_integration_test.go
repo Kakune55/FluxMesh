@@ -19,6 +19,9 @@ func TestServicesCASFlow(t *testing.T) {
 		Name:      "payment-svc",
 		Namespace: "prod",
 		Version:   "v1",
+		TrafficPolicy: model.ServiceTrafficPolicy{
+			Listener: model.ListenerPolicy{Port: 18080},
+		},
 		Routes: []model.ServiceRoute{
 			{PathPrefix: "/", Destination: "payment-v1", Weight: 100},
 		},

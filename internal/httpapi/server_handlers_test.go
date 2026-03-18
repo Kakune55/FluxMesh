@@ -64,7 +64,7 @@ func TestHandleServiceByNameValidation(t *testing.T) {
 	})
 
 	t.Run("name mismatch", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/services/payment-svc", bytes.NewBufferString(`{"name":"other-svc","routes":[{"path_prefix":"/","destination":"v1"}]}`))
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/services/payment-svc", bytes.NewBufferString(`{"name":"other-svc","traffic_policy":{"listener":{"port":18080}},"routes":[{"path_prefix":"/","destination":"v1"}]}`))
 		w := httptest.NewRecorder()
 		s.handleServiceByName(w, req)
 		if w.Code != http.StatusBadRequest {
@@ -73,7 +73,7 @@ func TestHandleServiceByNameValidation(t *testing.T) {
 	})
 
 	t.Run("missing resource version", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/services/payment-svc", bytes.NewBufferString(`{"name":"payment-svc","routes":[{"path_prefix":"/","destination":"v1"}]}`))
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/services/payment-svc", bytes.NewBufferString(`{"name":"payment-svc","traffic_policy":{"listener":{"port":18080}},"routes":[{"path_prefix":"/","destination":"v1"}]}`))
 		w := httptest.NewRecorder()
 		s.handleServiceByName(w, req)
 		if w.Code != http.StatusBadRequest {
@@ -90,6 +90,9 @@ func TestHandleServiceByNameCASAndDelete(t *testing.T) {
 		Name:      "payment-svc",
 		Namespace: "prod",
 		Version:   "v1",
+		TrafficPolicy: model.ServiceTrafficPolicy{
+			Listener: model.ListenerPolicy{Port: 18080},
+		},
 		Routes: []model.ServiceRoute{
 			{PathPrefix: "/", Destination: "payment-v1", Weight: 100},
 		},
@@ -124,7 +127,7 @@ func TestHandleServiceByNameCASAndDelete(t *testing.T) {
 	})
 
 	t.Run("put success then conflict", func(t *testing.T) {
-		bodyOK := bytes.NewBufferString(`{"name":"payment-svc","namespace":"prod","version":"v2","routes":[{"path_prefix":"/","destination":"payment-v2","weight":100}]}`)
+		bodyOK := bytes.NewBufferString(`{"name":"payment-svc","namespace":"prod","version":"v2","traffic_policy":{"listener":{"port":18080}},"routes":[{"path_prefix":"/","destination":"payment-v2","weight":100}]}`)
 		reqOK := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/services/payment-svc?resource_version=%d", current.ResourceVersion), bodyOK)
 		reqOK.Header.Set("X-Operator", "qa-bot")
 		wOK := httptest.NewRecorder()
@@ -144,7 +147,7 @@ func TestHandleServiceByNameCASAndDelete(t *testing.T) {
 			t.Fatalf("expected updated_at to be set")
 		}
 
-		bodyConflict := bytes.NewBufferString(`{"name":"payment-svc","namespace":"prod","version":"v3","routes":[{"path_prefix":"/","destination":"payment-v3","weight":100}]}`)
+		bodyConflict := bytes.NewBufferString(`{"name":"payment-svc","namespace":"prod","version":"v3","traffic_policy":{"listener":{"port":18080}},"routes":[{"path_prefix":"/","destination":"payment-v3","weight":100}]}`)
 		reqConflict := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/services/payment-svc?resource_version=%d", current.ResourceVersion), bodyConflict)
 		wConflict := httptest.NewRecorder()
 		s.handleServiceByName(wConflict, reqConflict)

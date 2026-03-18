@@ -230,6 +230,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 		}
 
 		applyOperatorMetadata(&cfg, r)
+		cfg.ApplyDefaults()
 
 		if err := cfg.Validate(); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -287,6 +288,7 @@ func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Name = name
 		applyOperatorMetadata(&cfg, r)
+		cfg.ApplyDefaults()
 
 		if err := cfg.Validate(); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -302,16 +304,16 @@ func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
 		updated, err := s.services.UpdateWithRevision(r.Context(), name, cfg, rev)
 		if err != nil {
 			if errors.Is(err, registry.ErrServiceConflict) {
-					latest, getErr := s.services.Get(r.Context(), name)
-					if getErr == nil {
-						writeJSON(w, http.StatusConflict, map[string]any{
-							"error":                    err.Error(),
-							"current_resource_version": latest.ResourceVersion,
-							"current_config":           latest,
-						})
-						return
-					}
-					writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				latest, getErr := s.services.Get(r.Context(), name)
+				if getErr == nil {
+					writeJSON(w, http.StatusConflict, map[string]any{
+						"error":                    err.Error(),
+						"current_resource_version": latest.ResourceVersion,
+						"current_config":           latest,
+					})
+					return
+				}
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 				return
 			}
 			if errors.Is(err, registry.ErrServiceNotFound) {

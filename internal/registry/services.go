@@ -26,6 +26,11 @@ func NewServices(cli *clientv3.Client) *Services {
 }
 
 func (s *Services) Put(ctx context.Context, cfg model.ServiceConfig) error {
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
 	cfg.ResourceVersion = 0
 	stampServiceAudit(&cfg)
 	payload, err := json.Marshal(cfg)
@@ -80,6 +85,11 @@ func (s *Services) UpdateWithRevision(ctx context.Context, name string, cfg mode
 	}
 
 	cfg.Name = name
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return model.ServiceConfig{}, err
+	}
+
 	cfg.ResourceVersion = 0
 	stampServiceAudit(&cfg)
 	payload, err := json.Marshal(cfg)
