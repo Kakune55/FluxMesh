@@ -14,7 +14,19 @@ type ServiceConfig struct {
 	UpdatedAt       string               `json:"updated_at,omitempty"`
 	UpdatedBy       string               `json:"updated_by,omitempty"`
 	Routes          []ServiceRoute       `json:"routes"`
+	BackendGroups   []BackendGroup       `json:"backend_groups,omitempty"`
 	TrafficPolicy   ServiceTrafficPolicy `json:"traffic_policy"`
+}
+
+type BackendGroup struct {
+	Name    string          `json:"name"`
+	Targets []BackendTarget `json:"targets"`
+}
+
+type BackendTarget struct {
+	Addr   string            `json:"addr"`
+	Weight int               `json:"weight,omitempty"`
+	Tags   map[string]string `json:"tags,omitempty"`
 }
 
 type ServiceRoute struct {
@@ -55,6 +67,7 @@ type RelayPolicy struct {
 	MaxHops int `json:"max_hops,omitempty"`
 }
 
+// ApplyDefaults 填充服务配置的最小可运行默认值。
 func (s *ServiceConfig) ApplyDefaults() {
 	if strings.TrimSpace(s.TrafficPolicy.Listener.Addr) == "" {
 		s.TrafficPolicy.Listener.Addr = "0.0.0.0"
@@ -76,8 +89,17 @@ func (s *ServiceConfig) ApplyDefaults() {
 			s.Routes[i].Hosts = []string{"*"}
 		}
 	}
+
+	for i := range s.BackendGroups {
+		for j := range s.BackendGroups[i].Targets {
+			if s.BackendGroups[i].Targets[j].Weight == 0 {
+				s.BackendGroups[i].Targets[j].Weight = 100
+			}
+		}
+	}
 }
 
+// Validate 校验服务配置字段完整性和约束范围。
 func (s ServiceConfig) Validate() error {
 	if strings.TrimSpace(s.Name) == "" {
 		return fmt.Errorf("name is required")
@@ -112,6 +134,33 @@ func (s ServiceConfig) Validate() error {
 		return fmt.Errorf("at least one route is required")
 	}
 
+	backendNames := make(map[string]struct{}, len(s.BackendGroups))
+	for i, group := range s.BackendGroups {
+		name := strings.TrimSpace(group.Name)
+		if name == "" {
+			return fmt.Errorf("backend_groups[%d].name is required", i)
+		}
+		if _, exists := backendNames[name]; exists {
+			return fmt.Errorf("backend_groups[%d].name duplicated: %s", i, name)
+		}
+		backendNames[name] = struct{}{}
+
+		if len(group.Targets) == 0 {
+			return fmt.Errorf("backend_groups[%d].targets requires at least one target", i)
+		}
+		for j, target := range group.Targets {
+			if strings.TrimSpace(target.Addr) == "" {
+				return fmt.Errorf("backend_groups[%d].targets[%d].addr is required", i, j)
+			}
+			if !isValidTargetAddr(target.Addr) {
+				return fmt.Errorf("backend_groups[%d].targets[%d].addr must be host:port", i, j)
+			}
+			if target.Weight < 1 || target.Weight > 100 {
+				return fmt.Errorf("backend_groups[%d].targets[%d].weight must be between 1 and 100", i, j)
+			}
+		}
+	}
+
 	for i, route := range s.Routes {
 		if len(route.Hosts) == 0 {
 			return fmt.Errorf("routes[%d].hosts is required after defaults", i)
@@ -138,6 +187,7 @@ func (s ServiceConfig) Validate() error {
 	return nil
 }
 
+// isValidListenerAddr 校验监听地址是否为可绑定 IPv4。
 func isValidListenerAddr(addr string) bool {
 	trimmed := strings.TrimSpace(addr)
 	if trimmed == "" {
@@ -155,4 +205,20 @@ func isValidListenerAddr(addr string) bool {
 	}
 
 	return true
+}
+
+// isValidTargetAddr 校验后端目标地址是否为合法 host:port。
+func isValidTargetAddr(addr string) bool {
+	host, portRaw, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if strings.TrimSpace(host) == "" {
+		return false
+	}
+	var port int
+	if _, err := fmt.Sscan(portRaw, &port); err != nil {
+		return false
+	}
+	return port >= 1 && port <= 65535
 }

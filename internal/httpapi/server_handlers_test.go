@@ -335,3 +335,103 @@ func TestHandleNodesAttachSysLoadFromSoftKV(t *testing.T) {
 		t.Fatalf("expected memory_usage=56.78, got %v", nodes[0].SysLoad.MemoryUsage)
 	}
 }
+
+func TestHandleTrafficPlanAndMatch(t *testing.T) {
+	emb := etcdtest.Start(t)
+	s := &Server{services: registry.NewServices(emb.Client)}
+
+	seed := model.ServiceConfig{
+		Name: "payment-svc",
+		TrafficPolicy: model.ServiceTrafficPolicy{
+			Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+		},
+		BackendGroups: []model.BackendGroup{
+			{
+				Name: "payment-v1",
+				Targets: []model.BackendTarget{
+					{Addr: "127.0.0.1:28081", Weight: 100},
+				},
+			},
+			{
+				Name: "payment-fallback",
+				Targets: []model.BackendTarget{
+					{Addr: "127.0.0.1:28082", Weight: 100},
+				},
+			},
+		},
+		Routes: []model.ServiceRoute{
+			{Hosts: []string{"pay.example.com"}, PathPrefix: "/", Destination: "payment-v1", Weight: 100},
+			{Hosts: []string{"*"}, PathPrefix: "/fallback", Destination: "payment-fallback", Weight: 50},
+		},
+	}
+	if err := s.services.Put(t.Context(), seed); err != nil {
+		t.Fatalf("seed put failed: %v", err)
+	}
+
+	t.Run("plan ok", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/plan", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficPlan(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		listeners, ok := payload["listeners"].([]any)
+		if !ok || len(listeners) != 1 {
+			t.Fatalf("expected one listener in plan, got %+v", payload["listeners"])
+		}
+	})
+
+	t.Run("match exact host", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/match?addr=0.0.0.0&port=18080&host=pay.example.com&path=/checkout", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficMatch(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d, body=%s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		var match map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &match); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if match["destination"] != "payment-v1" {
+			t.Fatalf("expected payment-v1, got %+v", match["destination"])
+		}
+		if match["resolved_destination"] != "127.0.0.1:28081" {
+			t.Fatalf("expected resolved_destination 127.0.0.1:28081, got %+v", match["resolved_destination"])
+		}
+	})
+
+	t.Run("match wildcard host", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/match?addr=0.0.0.0&port=18080&host=unknown.example.com&path=/fallback/1", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficMatch(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d, body=%s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		var match map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &match); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if match["destination"] != "payment-fallback" {
+			t.Fatalf("expected payment-fallback, got %+v", match["destination"])
+		}
+		if match["resolved_destination"] != "127.0.0.1:28082" {
+			t.Fatalf("expected resolved_destination 127.0.0.1:28082, got %+v", match["resolved_destination"])
+		}
+	})
+
+	t.Run("match no route", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/match?addr=127.0.0.1&port=18080&host=pay.example.com&path=/", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficMatch(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected %d, got %d", http.StatusNotFound, w.Code)
+		}
+	})
+}

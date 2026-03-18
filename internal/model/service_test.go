@@ -117,6 +117,12 @@ func TestServiceConfigApplyDefaults(t *testing.T) {
 		TrafficPolicy: ServiceTrafficPolicy{
 			Listener: ListenerPolicy{Port: 18080},
 		},
+		BackendGroups: []BackendGroup{
+			{
+				Name:    "payment-v1",
+				Targets: []BackendTarget{{Addr: "127.0.0.1:28081"}},
+			},
+		},
 		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "payment-v1"}},
 	}
 
@@ -136,5 +142,8 @@ func TestServiceConfigApplyDefaults(t *testing.T) {
 	}
 	if cfg.Routes[0].Weight != 100 {
 		t.Fatalf("expected route weight default 100, got %d", cfg.Routes[0].Weight)
+	}
+	if cfg.BackendGroups[0].Targets[0].Weight != 100 {
+		t.Fatalf("expected backend target weight default 100, got %d", cfg.BackendGroups[0].Targets[0].Weight)
 	}
 }

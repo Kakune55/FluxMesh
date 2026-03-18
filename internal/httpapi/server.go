@@ -16,6 +16,7 @@ import (
 	"fluxmesh/internal/model"
 	"fluxmesh/internal/registry"
 	"fluxmesh/internal/softkv"
+	"fluxmesh/internal/traffic"
 )
 
 type Server struct {
@@ -36,6 +37,8 @@ func NewServer(addr string, nodes *registry.Service, services *registry.Services
 	mux.HandleFunc("/api/v1/nodes/", s.handleNodeByID)
 	mux.HandleFunc("/api/v1/services", s.handleServices)
 	mux.HandleFunc("/api/v1/services/", s.handleServiceByName)
+	mux.HandleFunc("/api/v1/traffic/plan", s.handleTrafficPlan)
+	mux.HandleFunc("/api/v1/traffic/match", s.handleTrafficMatch)
 	mux.HandleFunc("/api/v1/softkv", s.handleSoftKV)
 	mux.HandleFunc("/api/v1/softkv/stats", s.handleSoftKVStats)
 	mux.HandleFunc("/api/v1/softkv/", s.handleSoftKVByKey)
@@ -339,6 +342,97 @@ func (s *Server) handleServiceByName(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
+}
+
+func (s *Server) handleTrafficPlan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.services == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "services storage not initialized"})
+		return
+	}
+
+	items, err := s.services.List(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	plan, err := traffic.BuildPlan(items)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"listeners": plan.Listeners()})
+}
+
+func (s *Server) handleTrafficMatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.services == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "services storage not initialized"})
+		return
+	}
+
+	addr := strings.TrimSpace(r.URL.Query().Get("addr"))
+	if addr == "" {
+		addr = "0.0.0.0"
+	}
+
+	portRaw := strings.TrimSpace(r.URL.Query().Get("port"))
+	port, err := strconv.Atoi(portRaw)
+	if err != nil || port < 1 || port > 65535 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "port must be between 1 and 65535"})
+		return
+	}
+
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	if host == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "host is required"})
+		return
+	}
+
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	if path == "" {
+		path = "/"
+	}
+
+	items, err := s.services.List(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	plan, err := traffic.BuildPlan(items)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	result, ok := plan.Match(addr, port, host, path)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no route matched"})
+		return
+	}
+
+	resolved, err := plan.ResolveDestination(result.Destination)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"listener":             result.Listener,
+		"service_name":         result.ServiceName,
+		"destination":          result.Destination,
+		"resolved_destination": resolved,
+		"path_prefix":          result.PathPrefix,
+	})
 }
 
 func (s *Server) handleSoftKV(w http.ResponseWriter, r *http.Request) {

@@ -20,6 +20,7 @@ import (
 	"fluxmesh/internal/registry"
 	"fluxmesh/internal/softkv"
 	"fluxmesh/internal/sysmetrics"
+	"fluxmesh/internal/traffic"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -34,6 +35,7 @@ type App struct {
 	softBus      *softkv.Bus
 	softWriter   *softkv.Writer
 	http         *httpapi.Server
+	traffic      *traffic.Server
 	reconciler   *reconcile.MemberReconciler
 	metrics      *sysmetrics.Collector
 	selfNode     model.Node
@@ -95,16 +97,17 @@ func (a *App) Run(parent context.Context) error {
 
 	a.nodes = registry.NewService(a.client)
 	a.services = registry.NewServices(a.client)
+	a.traffic = traffic.NewServer(a.services)
 	// 首次注册节点元信息，并绑定租约确保失联自动过期。
 	nodeStatus := model.NodeStatus{
-		NodeRole: string(a.cfg.Role),
+		NodeRole:   string(a.cfg.Role),
 		NodeStatus: "Ready",
 	}
 
 	node := model.Node{
-		ID:      a.cfg.NodeID,
-		IP:      a.cfg.IP,
-		Version: a.cfg.Version,
+		ID:         a.cfg.NodeID,
+		IP:         a.cfg.IP,
+		Version:    a.cfg.Version,
 		NodeStatus: nodeStatus,
 	}
 	a.selfNode = node
@@ -137,6 +140,10 @@ func (a *App) Run(parent context.Context) error {
 		a.runSoftKVBus(ctx)
 	}()
 
+	if err := a.traffic.Start(ctx); err != nil {
+		return err
+	}
+
 	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.services, a.softStore, a.cfg.Version)
 	return a.http.Start()
 }
@@ -149,6 +156,12 @@ func (a *App) Shutdown(ctx context.Context) error {
 	var shutdownErr error
 	if a.http != nil {
 		if err := a.http.Shutdown(ctx); err != nil {
+			shutdownErr = err
+		}
+	}
+
+	if a.traffic != nil {
+		if err := a.traffic.Shutdown(ctx); err != nil && shutdownErr == nil {
 			shutdownErr = err
 		}
 	}

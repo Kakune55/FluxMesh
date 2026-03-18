@@ -18,6 +18,7 @@ services:
       - --peer-advertise-url=http://server-1:2380
       - --admin-addr=:15000
     ports:
+      - "80:80"
       - "15000:15000"
       - "2379:2379"
       - "2380:2380"
