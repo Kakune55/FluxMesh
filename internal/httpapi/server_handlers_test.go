@@ -434,4 +434,44 @@ func TestHandleTrafficPlanAndMatch(t *testing.T) {
 			t.Fatalf("expected %d, got %d", http.StatusNotFound, w.Code)
 		}
 	})
+
+	t.Run("match invalid port", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/match?addr=0.0.0.0&port=99999&host=pay.example.com&path=/", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficMatch(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected %d, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	t.Run("match missing host", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/match?addr=0.0.0.0&port=18080&path=/", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficMatch(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected %d, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	t.Run("match unresolved destination", func(t *testing.T) {
+		broken := model.ServiceConfig{
+			Name: "broken-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+			},
+			Routes: []model.ServiceRoute{
+				{Hosts: []string{"broken.example.com"}, PathPrefix: "/", Destination: "missing-backend", Weight: 100},
+			},
+		}
+		if err := s.services.Put(t.Context(), broken); err != nil {
+			t.Fatalf("seed broken service failed: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/match?addr=0.0.0.0&port=18080&host=broken.example.com&path=/", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficMatch(w, req)
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("expected %d, got %d, body=%s", http.StatusBadGateway, w.Code, w.Body.String())
+		}
+	})
 }

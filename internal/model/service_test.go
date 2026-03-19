@@ -99,6 +99,70 @@ func TestServiceConfigValidateInvalid(t *testing.T) {
 				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "svc", Weight: 100}},
 			},
 		},
+		{
+			name: "invalid lb strategy",
+			cfg: ServiceConfig{
+				Name: "payment-svc",
+				TrafficPolicy: ServiceTrafficPolicy{
+					Listener: ListenerPolicy{Port: 18080},
+					LB:       LBPolicy{Strategy: "hash@v1"},
+				},
+				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "svc", Weight: 100}},
+			},
+		},
+		{
+			name: "duplicate backend group name",
+			cfg: ServiceConfig{
+				Name: "payment-svc",
+				TrafficPolicy: ServiceTrafficPolicy{
+					Listener: ListenerPolicy{Port: 18080},
+				},
+				BackendGroups: []BackendGroup{
+					{Name: "bg", Targets: []BackendTarget{{Addr: "127.0.0.1:28081", Weight: 100}}},
+					{Name: "bg", Targets: []BackendTarget{{Addr: "127.0.0.1:28082", Weight: 100}}},
+				},
+				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "bg", Weight: 100}},
+			},
+		},
+		{
+			name: "backend group without targets",
+			cfg: ServiceConfig{
+				Name: "payment-svc",
+				TrafficPolicy: ServiceTrafficPolicy{
+					Listener: ListenerPolicy{Port: 18080},
+				},
+				BackendGroups: []BackendGroup{{Name: "bg", Targets: []BackendTarget{}}},
+				Routes:        []ServiceRoute{{PathPrefix: "/", Destination: "bg", Weight: 100}},
+			},
+		},
+		{
+			name: "backend target invalid addr",
+			cfg: ServiceConfig{
+				Name: "payment-svc",
+				TrafficPolicy: ServiceTrafficPolicy{
+					Listener: ListenerPolicy{Port: 18080},
+				},
+				BackendGroups: []BackendGroup{{
+					Name:    "bg",
+					Targets: []BackendTarget{{Addr: "127.0.0.1", Weight: 100}},
+				}},
+				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "bg", Weight: 100}},
+			},
+		},
+		{
+			name: "backend target invalid weight",
+			cfg: ServiceConfig{
+				Name: "payment-svc",
+				TrafficPolicy: ServiceTrafficPolicy{
+					Listener: ListenerPolicy{Port: 18080},
+				},
+				BackendGroups: []BackendGroup{{
+					Name:    "bg",
+					Targets: []BackendTarget{{Addr: "127.0.0.1:28081", Weight: 101}},
+				}},
+				Routes: []ServiceRoute{{PathPrefix: "/", Destination: "bg", Weight: 100}},
+			},
+		},
 	}
 
 	for _, tt := range tests {

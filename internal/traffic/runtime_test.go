@@ -6,6 +6,14 @@ import (
 	"fluxmesh/internal/model"
 )
 
+type fixedAddrBalancer struct {
+	addr string
+}
+
+func (b *fixedAddrBalancer) Pick(_ string, _ model.BackendGroup, _ *planState) (string, error) {
+	return b.addr, nil
+}
+
 func TestBuildPlanAndMatch(t *testing.T) {
 	services := []model.ServiceConfig{
 		{
@@ -143,5 +151,250 @@ func TestResolveDestinationServiceFallback(t *testing.T) {
 	}
 	if resolved != "127.0.0.1:19080" {
 		t.Fatalf("expected service listener fallback 127.0.0.1:19080, got %s", resolved)
+	}
+}
+
+func TestResolveDestinationDirectAndUnresolved(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "gateway-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "127.0.0.1", Port: 18080},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:28090", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	resolved, err := plan.ResolveDestination("https://example.com:443")
+	if err != nil {
+		t.Fatalf("resolve direct url failed: %v", err)
+	}
+	if resolved != "https://example.com:443" {
+		t.Fatalf("expected unchanged direct url, got %s", resolved)
+	}
+
+	resolved, err = plan.ResolveDestination("127.0.0.1:28090")
+	if err != nil {
+		t.Fatalf("resolve direct host:port failed: %v", err)
+	}
+	if resolved != "127.0.0.1:28090" {
+		t.Fatalf("expected unchanged direct host:port, got %s", resolved)
+	}
+
+	_, err = plan.ResolveDestination("unknown-destination")
+	if err == nil {
+		t.Fatalf("expected unresolved destination error")
+	}
+}
+
+func TestBuildPlanDuplicateBackendGroupName(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "svc-a",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+			},
+			BackendGroups: []model.BackendGroup{{
+				Name:    "shared",
+				Targets: []model.BackendTarget{{Addr: "127.0.0.1:28081", Weight: 100}},
+			}},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "shared", Weight: 100}},
+		},
+		{
+			Name: "svc-b",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18081},
+			},
+			BackendGroups: []model.BackendGroup{{
+				Name:    "shared",
+				Targets: []model.BackendTarget{{Addr: "127.0.0.1:28082", Weight: 100}},
+			}},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "shared", Weight: 100}},
+		},
+	}
+
+	_, err := BuildPlan(services)
+	if err == nil {
+		t.Fatalf("expected duplicate backend group build error")
+	}
+}
+
+func TestResolveDestinationRoundRobinStrategy(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "round-robin"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{
+					Name: "payment-v1",
+					Targets: []model.BackendTarget{
+						{Addr: "127.0.0.1:28081", Weight: 100},
+						{Addr: "127.0.0.1:28082", Weight: 100},
+					},
+				},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	first, err := plan.ResolveDestination("payment-v1")
+	if err != nil {
+		t.Fatalf("resolve first failed: %v", err)
+	}
+	second, err := plan.ResolveDestination("payment-v1")
+	if err != nil {
+		t.Fatalf("resolve second failed: %v", err)
+	}
+	third, err := plan.ResolveDestination("payment-v1")
+	if err != nil {
+		t.Fatalf("resolve third failed: %v", err)
+	}
+
+	if first != "127.0.0.1:28081" || second != "127.0.0.1:28082" || third != "127.0.0.1:28081" {
+		t.Fatalf("unexpected round-robin sequence: %s, %s, %s", first, second, third)
+	}
+}
+
+func TestResolveDestinationRandomStrategy(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "random"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{
+					Name: "payment-v1",
+					Targets: []model.BackendTarget{
+						{Addr: "127.0.0.1:28081", Weight: 1},
+						{Addr: "127.0.0.1:28082", Weight: 9},
+					},
+				},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		resolved, err := plan.ResolveDestination("payment-v1")
+		if err != nil {
+			t.Fatalf("resolve random failed: %v", err)
+		}
+		if resolved != "127.0.0.1:28081" && resolved != "127.0.0.1:28082" {
+			t.Fatalf("unexpected random resolved target: %s", resolved)
+		}
+	}
+}
+
+func TestResolveDestinationLatencyFirstStrategy(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "latency-first"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{
+					Name: "payment-v1",
+					Targets: []model.BackendTarget{
+						{Addr: "127.0.0.1:28081", Weight: 10},
+						{Addr: "127.0.0.1:28082", Weight: 100},
+					},
+				},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	resolved, err := plan.ResolveDestination("payment-v1")
+	if err != nil {
+		t.Fatalf("resolve latency-first failed: %v", err)
+	}
+	if resolved != "127.0.0.1:28082" {
+		t.Fatalf("expected highest-priority target 127.0.0.1:28082, got %s", resolved)
+	}
+}
+
+func TestResolveDestinationUnregisteredCustomStrategy(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "custom-plug"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{Name: "payment-v1", Targets: []model.BackendTarget{{Addr: "127.0.0.1:28081", Weight: 100}}},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	_, err = plan.ResolveDestination("payment-v1")
+	if err == nil {
+		t.Fatalf("expected unregistered balancer error")
+	}
+}
+
+func TestResolveDestinationRegisteredCustomStrategy(t *testing.T) {
+	if err := RegisterBalancer("custom-plug", &fixedAddrBalancer{addr: "127.0.0.1:29999"}); err != nil {
+		t.Fatalf("register custom balancer failed: %v", err)
+	}
+
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "custom-plug"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{Name: "payment-v1", Targets: []model.BackendTarget{{Addr: "127.0.0.1:28081", Weight: 100}}},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	resolved, err := plan.ResolveDestination("payment-v1")
+	if err != nil {
+		t.Fatalf("resolve custom strategy failed: %v", err)
+	}
+	if resolved != "127.0.0.1:29999" {
+		t.Fatalf("expected custom balancer addr 127.0.0.1:29999, got %s", resolved)
 	}
 }
