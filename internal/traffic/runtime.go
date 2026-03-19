@@ -32,7 +32,9 @@ type ListenerPlan struct {
 type Plan struct {
 	listeners        map[string]ListenerPlan
 	backendGroups    map[string]model.BackendGroup
+	backendStrategy  map[string]string
 	serviceListeners map[string]ListenerKey
+	state            *planState
 }
 
 type MatchResult struct {
@@ -46,6 +48,7 @@ type MatchResult struct {
 func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	listeners := make(map[string]ListenerPlan)
 	backendGroups := make(map[string]model.BackendGroup)
+	backendStrategy := make(map[string]string)
 	serviceListeners := make(map[string]ListenerKey)
 
 	for i := range services {
@@ -62,6 +65,7 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 				return Plan{}, fmt.Errorf("duplicated backend group name: %s", name)
 			}
 			backendGroups[name] = group
+			backendStrategy[name] = normalizeLBStrategy(cfg.TrafficPolicy.LB.Strategy)
 		}
 
 		key := listenerMapKey(cfg.TrafficPolicy.Listener.Addr, cfg.TrafficPolicy.Listener.Port)
@@ -101,7 +105,9 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	return Plan{
 		listeners:        listeners,
 		backendGroups:    backendGroups,
+		backendStrategy:  backendStrategy,
 		serviceListeners: serviceListeners,
+		state:            newPlanState(),
 	}, nil
 }
 
@@ -166,7 +172,8 @@ func (p Plan) ResolveDestination(destination string) (string, error) {
 	}
 
 	if group, ok := p.backendGroups[destination]; ok {
-		target, err := selectBackendTarget(group)
+		strategy := p.backendStrategy[destination]
+		target, err := p.selectBackendTarget(destination, group, strategy)
 		if err != nil {
 			return "", err
 		}
@@ -222,25 +229,6 @@ func hostMatchScore(routeHosts []string, requestHost string) (int, bool) {
 		return 0, false
 	}
 	return best, true
-}
-
-// selectBackendTarget 按权重优先选出后端组目标地址。
-func selectBackendTarget(group model.BackendGroup) (string, error) {
-	if len(group.Targets) == 0 {
-		return "", fmt.Errorf("backend group %q has no targets", group.Name)
-	}
-
-	best := group.Targets[0]
-	for _, target := range group.Targets[1:] {
-		if target.Weight > best.Weight {
-			best = target
-			continue
-		}
-		if target.Weight == best.Weight && target.Addr < best.Addr {
-			best = target
-		}
-	}
-	return best.Addr, nil
 }
 
 // isDirectDestination 判断 destination 是否为可直接代理的地址格式。

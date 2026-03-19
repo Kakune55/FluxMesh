@@ -121,6 +121,10 @@ func (s ServiceConfig) Validate() error {
 		return fmt.Errorf("traffic_policy.proxy.layer must be l7-http or l4-tcp")
 	}
 
+	if !isValidLBStrategy(s.TrafficPolicy.LB.Strategy) {
+		return fmt.Errorf("traffic_policy.lb.strategy must use [a-z0-9-], e.g. load-first, round-robin, random")
+	}
+
 	if len(s.TrafficPolicy.Protocols) == 0 {
 		return fmt.Errorf("traffic_policy.protocols must include at least one protocol")
 	}
@@ -221,4 +225,21 @@ func isValidTargetAddr(addr string) bool {
 		return false
 	}
 	return port >= 1 && port <= 65535
+}
+
+// isValidLBStrategy 校验服务级负载均衡策略是否在支持列表中。
+func isValidLBStrategy(strategy string) bool {
+	s := strings.ToLower(strings.TrimSpace(strategy))
+	switch s {
+	case "", "load-first", "latency-first", "round-robin", "rr", "random", "rand":
+		return true
+	}
+
+	for _, ch := range s {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			continue
+		}
+		return false
+	}
+	return s != ""
 }

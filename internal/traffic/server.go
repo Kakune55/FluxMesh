@@ -102,6 +102,10 @@ func (s *Server) refresh(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
+	if s.plan.state != nil {
+		// 保留轮询状态，避免每次刷新重置后端选择序列。
+		plan.state = s.plan.state
+	}
 	s.plan = plan
 
 	for key, srv := range s.listeners {

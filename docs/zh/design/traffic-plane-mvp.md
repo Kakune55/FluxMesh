@@ -123,7 +123,7 @@ MVP 建议默认值：
 
 | 字段 | 数据类型 | 可选/必选 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
-| `traffic.lb.strategy` | `str` | 可选 | `load-first` | `load-first` 或 `latency-first`。 |
+| `traffic.lb.strategy` | `str` | 可选 | `load-first` | 支持 `load-first`、`latency-first`、`round-robin`、`random`。 |
 | `traffic.relay.max_hops` | `int` | 可选 | `2` | 中继最大跳数。 |
 | `traffic.retry.max_attempts` | `int` | 可选 | `1` | 全局重试尝试次数默认值；`1` 表示默认不重试。 |
 | `traffic.retry.budget_ratio` | `float` | 可选 | `0` | 全局重试预算比例，`0` 表示默认不启用重试预算。 |
@@ -136,7 +136,7 @@ MVP 建议默认值：
 | `protocols` | `list[str]` | 可选 | `["http"]` | 预留协议字段，MVP 固定为 HTTP。 |
 | `listener.addr` | `str` | 可选 | `0.0.0.0` | 服务监听地址；可指定 `127.0.0.1`、`0.0.0.0` 或具体网卡 IP。 |
 | `listener.port` | `int` | 必选 | 无 | 服务声明监听端口；运行时可自动与其他服务复用同地址同端口监听。 |
-| `lb.strategy` | `str` | 可选 | 继承全局 | 可按服务切换调度策略。 |
+| `lb.strategy` | `str` | 可选 | 继承全局 | 可按服务切换调度策略（`load-first` / `latency-first` / `round-robin` / `random`）。 |
 | `retry.max_attempts` | `int` | 可选 | 继承全局 | 建议不超过 `2`。 |
 | `retry.budget_ratio` | `float` | 可选 | 继承全局 | 服务级重试预算。 |
 | `relay.max_hops` | `int` | 可选 | 继承全局 | 服务级中继跳数覆盖。 |
