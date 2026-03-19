@@ -6,6 +6,12 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
+var (
+	cpuPercentFn    = cpu.Percent
+	virtualMemoryFn = mem.VirtualMemory
+	loadAvgFn       = load.Avg
+)
+
 type Snapshot struct {
 	CPUUsage      float64
 	MemoryUsage   float64
@@ -47,7 +53,7 @@ func (c *Collector) Collect() (Snapshot, error) {
 }
 
 func (c *Collector) readCPUUsage() (float64, error) {
-	usages, err := cpu.Percent(0, false)
+	usages, err := cpuPercentFn(0, false)
 	if err != nil {
 		return 0, err
 	}
@@ -66,7 +72,7 @@ func (c *Collector) readCPUUsage() (float64, error) {
 }
 
 func readMemoryUsage() (float64, error) {
-	v, err := mem.VirtualMemory()
+	v, err := virtualMemoryFn()
 	if err != nil {
 		return 0, err
 	}
@@ -82,7 +88,7 @@ func readMemoryUsage() (float64, error) {
 }
 
 func readLoadAvg() (float64, float64, float64, error) {
-	v, err := load.Avg()
+	v, err := loadAvgFn()
 	if err != nil {
 		return 0, 0, 0, err
 	}

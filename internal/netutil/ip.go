@@ -10,12 +10,18 @@ func DetectLANIPv4() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return detectLANIPv4FromInterfaces(interfaces, func(iface net.Interface) ([]net.Addr, error) {
+		return iface.Addrs()
+	})
+}
+
+func detectLANIPv4FromInterfaces(interfaces []net.Interface, addrLookup func(net.Interface) ([]net.Addr, error)) (string, error) {
 
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		addrs, addrErr := iface.Addrs()
+		addrs, addrErr := addrLookup(iface)
 		if addrErr != nil {
 			continue
 		}
