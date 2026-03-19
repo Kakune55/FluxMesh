@@ -475,3 +475,249 @@ func TestHandleTrafficPlanAndMatch(t *testing.T) {
 		}
 	})
 }
+
+func TestDecodeSysLoadFromValue(t *testing.T) {
+	t.Run("decode success", func(t *testing.T) {
+		load, ok := decodeSysLoadFromValue(map[string]any{
+			"CPUUsage":      11.1,
+			"MemoryUsage":   22.2,
+			"SystemLoad1m":  0.3,
+			"SystemLoad5m":  0.4,
+			"SystemLoad15m": 0.5,
+		})
+		if !ok {
+			t.Fatalf("expected decode success")
+		}
+		if load.CPUUsage != 11.1 || load.MemoryUsage != 22.2 || load.SystemLoad1m != 0.3 || load.SystemLoad5m != 0.4 || load.SystemLoad15m != 0.5 {
+			t.Fatalf("unexpected decoded load: %+v", load)
+		}
+	})
+
+	t.Run("decode invalid value", func(t *testing.T) {
+		if _, ok := decodeSysLoadFromValue(make(chan int)); ok {
+			t.Fatalf("expected decode failure for unsupported value")
+		}
+	})
+}
+
+func TestAttachNodeMetricsFromSoftKV(t *testing.T) {
+	nodes := []model.Node{{ID: "node-a"}, {ID: "node-b"}}
+
+	t.Run("nil store returns original nodes", func(t *testing.T) {
+		s := &Server{}
+		got := s.attachNodeMetricsFromSoftKV(t.Context(), append([]model.Node(nil), nodes...))
+		if len(got) != 2 {
+			t.Fatalf("expected 2 nodes, got %d", len(got))
+		}
+		if got[0].SysLoad.CPUUsage != 0 {
+			t.Fatalf("expected untouched node metrics, got %+v", got[0].SysLoad)
+		}
+	})
+
+	t.Run("attach by key and source id", func(t *testing.T) {
+		store := softkv.NewStore()
+		s := &Server{softStore: store}
+
+		_, err := store.Put(t.Context(), "metrics/nodes/node-a", map[string]any{
+			"CPUUsage":      10.5,
+			"MemoryUsage":   61.2,
+			"SystemLoad1m":  0.7,
+			"SystemLoad5m":  0.8,
+			"SystemLoad15m": 0.9,
+		}, 30*time.Second, "")
+		if err != nil {
+			t.Fatalf("seed node-a metric failed: %v", err)
+		}
+
+		_, err = store.Put(t.Context(), "metrics/nodes/", map[string]any{
+			"CPUUsage":      20.5,
+			"MemoryUsage":   71.2,
+			"SystemLoad1m":  1.7,
+			"SystemLoad5m":  1.8,
+			"SystemLoad15m": 1.9,
+		}, 30*time.Second, "node-b")
+		if err != nil {
+			t.Fatalf("seed node-b metric failed: %v", err)
+		}
+
+		_, err = store.Put(t.Context(), "metrics/nodes/node-c", map[string]any{"bad": make(chan int)}, 30*time.Second, "node-c")
+		if err != nil {
+			t.Fatalf("seed malformed metric failed: %v", err)
+		}
+
+		got := s.attachNodeMetricsFromSoftKV(t.Context(), append([]model.Node(nil), nodes...))
+		if got[0].SysLoad.CPUUsage != 10.5 {
+			t.Fatalf("expected node-a cpu usage 10.5, got %v", got[0].SysLoad.CPUUsage)
+		}
+		if got[1].SysLoad.CPUUsage != 20.5 {
+			t.Fatalf("expected node-b cpu usage 20.5, got %v", got[1].SysLoad.CPUUsage)
+		}
+	})
+}
+
+func TestHandleServices(t *testing.T) {
+	t.Run("services storage not initialized", func(t *testing.T) {
+		s := &Server{}
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/services", nil)
+		w := httptest.NewRecorder()
+		s.handleServices(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected %d, got %d", http.StatusInternalServerError, w.Code)
+		}
+	})
+
+	emb := etcdtest.Start(t)
+	services := registry.NewServices(emb.Client)
+	s := &Server{services: services}
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/services", nil)
+		w := httptest.NewRecorder()
+		s.handleServices(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected %d, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+
+	t.Run("post invalid json", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/services", bytes.NewBufferString("{"))
+		w := httptest.NewRecorder()
+		s.handleServices(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected %d, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	t.Run("post invalid config", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/services", bytes.NewBufferString(`{"name":"bad-svc","traffic_policy":{"listener":{"port":18080}},"routes":[{"path_prefix":"/","destination":"","weight":100}]}`))
+		w := httptest.NewRecorder()
+		s.handleServices(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected %d, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	t.Run("post and list success", func(t *testing.T) {
+		body := `{"name":"orders-svc","namespace":"prod","version":"v1","traffic_policy":{"listener":{"addr":"0.0.0.0","port":18081}},"backend_groups":[{"name":"orders-v1","targets":[{"addr":"127.0.0.1:28101","weight":100}]}],"routes":[{"hosts":["orders.example.com"],"path_prefix":"/","destination":"orders-v1","weight":100}]}`
+		reqPost := httptest.NewRequest(http.MethodPost, "/api/v1/services", bytes.NewBufferString(body))
+		reqPost.Header.Set("X-Operator", "test-operator")
+		wPost := httptest.NewRecorder()
+		s.handleServices(wPost, reqPost)
+		if wPost.Code != http.StatusCreated {
+			t.Fatalf("expected %d, got %d body=%s", http.StatusCreated, wPost.Code, wPost.Body.String())
+		}
+
+		var created model.ServiceConfig
+		if err := json.Unmarshal(wPost.Body.Bytes(), &created); err != nil {
+			t.Fatalf("decode created service failed: %v", err)
+		}
+		if created.UpdatedBy != "test-operator" {
+			t.Fatalf("expected updated_by=test-operator, got %s", created.UpdatedBy)
+		}
+
+		reqList := httptest.NewRequest(http.MethodGet, "/api/v1/services", nil)
+		wList := httptest.NewRecorder()
+		s.handleServices(wList, reqList)
+		if wList.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d", http.StatusOK, wList.Code)
+		}
+
+		var items []model.ServiceConfig
+		if err := json.Unmarshal(wList.Body.Bytes(), &items); err != nil {
+			t.Fatalf("decode list failed: %v", err)
+		}
+		if len(items) != 1 || items[0].Name != "orders-svc" {
+			t.Fatalf("expected one listed service orders-svc, got %+v", items)
+		}
+	})
+}
+
+func TestHandleNodeByID(t *testing.T) {
+	emb := etcdtest.Start(t)
+	nodesSvc := registry.NewService(emb.Client)
+	s := &Server{nodes: nodesSvc}
+
+	t.Run("missing node id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/nodes/", nil)
+		w := httptest.NewRecorder()
+		s.handleNodeByID(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected %d, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/nodes/node-a", nil)
+		w := httptest.NewRecorder()
+		s.handleNodeByID(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected %d, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+
+	t.Run("get and delete not found", func(t *testing.T) {
+		reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/nodes/missing", nil)
+		wGet := httptest.NewRecorder()
+		s.handleNodeByID(wGet, reqGet)
+		if wGet.Code != http.StatusNotFound {
+			t.Fatalf("expected %d, got %d", http.StatusNotFound, wGet.Code)
+		}
+
+		reqDel := httptest.NewRequest(http.MethodDelete, "/api/v1/nodes/missing", nil)
+		wDel := httptest.NewRecorder()
+		s.handleNodeByID(wDel, reqDel)
+		if wDel.Code != http.StatusNotFound {
+			t.Fatalf("expected %d, got %d", http.StatusNotFound, wDel.Code)
+		}
+	})
+
+	node := model.Node{
+		ID:      "node-a",
+		IP:      "10.0.0.1",
+		Version: "v1.0.0",
+		NodeStatus: model.NodeStatus{
+			NodeRole:   "agent",
+			NodeStatus: "Ready",
+		},
+	}
+
+	keepAliveCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	if _, _, err := nodesSvc.RegisterWithLease(t.Context(), keepAliveCtx, node, 30); err != nil {
+		t.Fatalf("register node failed: %v", err)
+	}
+
+	t.Run("get existing", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/nodes/node-a", nil)
+		w := httptest.NewRecorder()
+		s.handleNodeByID(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var got model.Node
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode node failed: %v", err)
+		}
+		if got.ID != "node-a" {
+			t.Fatalf("expected node-a, got %s", got.ID)
+		}
+	})
+
+	t.Run("delete existing", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/nodes/node-a", nil)
+		w := httptest.NewRecorder()
+		s.handleNodeByID(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d body=%s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/nodes/node-a", nil)
+		wGet := httptest.NewRecorder()
+		s.handleNodeByID(wGet, reqGet)
+		if wGet.Code != http.StatusNotFound {
+			t.Fatalf("expected %d after delete, got %d", http.StatusNotFound, wGet.Code)
+		}
+	})
+}
