@@ -26,8 +26,10 @@ type Server struct {
 
 	mu        sync.RWMutex
 	plan      Plan
+	planValue atomic.Value
 	listeners map[string]*http.Server
 	proxies   map[string]*httputil.ReverseProxy
+	targets   map[string]*url.URL
 	transport *http.Transport
 	metrics   trafficMetrics
 	metricsSampleRate atomic.Uint32
@@ -72,8 +74,10 @@ func NewServer(services *registry.Services) *Server {
 		services:  services,
 		listeners: make(map[string]*http.Server),
 		proxies:   make(map[string]*httputil.ReverseProxy),
+		targets:   make(map[string]*url.URL),
 		transport: transport,
 	}
+	s.planValue.Store(Plan{})
 	s.metricsSampleRate.Store(1)
 	return s
 }
@@ -151,6 +155,7 @@ func (s *Server) refresh(ctx context.Context) error {
 		plan.state = s.plan.state
 	}
 	s.plan = plan
+	s.planValue.Store(plan)
 
 	for key, srv := range s.listeners {
 		if _, ok := desired[key]; ok {
@@ -208,9 +213,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		path = "/"
 	}
 
-	s.mu.RLock()
-	plan := s.plan
-	s.mu.RUnlock()
+	plan := s.currentPlan()
 
 	match, ok := plan.Match(listener.Addr, listener.Port, host, path)
 	if !ok {
@@ -243,7 +246,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		}
 		relayHit := plan.IsRelayCandidate(match.Destination, resolved)
 
-		proxy, err := s.proxyForDestination(resolved)
+		target, err := s.targetForDestination(resolved)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return http.StatusBadGateway, 1, relayHit, sampleRate
@@ -254,9 +257,12 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		r.Header.Set(headerFluxMeshUpstream, resolved)
 		r.Header.Set(headerFluxMeshHops, strconv.Itoa(incomingHops+1))
 
-		cw := &statusCaptureWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		proxy.ServeHTTP(cw, r)
-		return cw.statusCode, 1, relayHit, sampleRate
+		statusCode, err := s.forwardDirect(w, r, target)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return http.StatusBadGateway, 1, relayHit, sampleRate
+		}
+		return statusCode, 1, relayHit, sampleRate
 	}
 
 	candidates, err := plan.ResolveDestinationsForAttempts(match.Destination, maxAttempts)
@@ -269,7 +275,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		resolved := candidates[0]
 		relayHit := plan.IsRelayCandidate(match.Destination, resolved)
 
-		proxy, err := s.proxyForDestination(resolved)
+		target, err := s.targetForDestination(resolved)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return http.StatusBadGateway, 1, relayHit, sampleRate
@@ -280,9 +286,12 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		r.Header.Set(headerFluxMeshUpstream, resolved)
 		r.Header.Set(headerFluxMeshHops, strconv.Itoa(incomingHops+1))
 
-		cw := &statusCaptureWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		proxy.ServeHTTP(cw, r)
-		return cw.statusCode, 1, relayHit, sampleRate
+		statusCode, err := s.forwardDirect(w, r, target)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return http.StatusBadGateway, 1, relayHit, sampleRate
+		}
+		return statusCode, 1, relayHit, sampleRate
 	}
 
 	body, err := maybeReadRequestBodyForRetry(r)
@@ -333,6 +342,22 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 
 	http.Error(w, "upstream proxy error: no candidate executed", http.StatusBadGateway)
 	return http.StatusBadGateway, 0, relayHit, sampleRate
+}
+
+func (s *Server) currentPlan() Plan {
+	if v := s.planValue.Load(); v != nil {
+		if plan, ok := v.(Plan); ok {
+			if plan.listeners != nil {
+				return plan
+			}
+		}
+	}
+
+	// 兼容测试中以字面量构造 Server 且未初始化 planValue 的场景。
+	s.mu.RLock()
+	plan := s.plan
+	s.mu.RUnlock()
+	return plan
 }
 
 func (s *Server) recordTrafficMetrics(elapsed time.Duration, statusCode int, attemptsUsed int, relayHit bool, sampleRate uint32) {
@@ -512,6 +537,110 @@ func (w *statusCaptureWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+var hopByHopHeaders = map[string]struct{}{
+	"connection":          {},
+	"proxy-connection":    {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+}
+
+func (s *Server) forwardDirect(w http.ResponseWriter, in *http.Request, target *url.URL) (int, error) {
+	outReq := in.Clone(in.Context())
+	outReq.URL = rewriteTargetURL(target, in.URL)
+	outReq.RequestURI = ""
+	outReq.Host = target.Host
+
+	cleanProxyHeaders(outReq)
+
+	var rt http.RoundTripper
+	if s.transport != nil {
+		rt = s.transport
+	} else {
+		rt = http.DefaultTransport
+	}
+	resp, err := rt.RoundTrip(outReq)
+	if err != nil {
+		return 0, fmt.Errorf("upstream proxy error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		return resp.StatusCode, fmt.Errorf("copy upstream response: %w", err)
+	}
+
+	return resp.StatusCode, nil
+}
+
+func rewriteTargetURL(target *url.URL, in *url.URL) *url.URL {
+	out := new(url.URL)
+	*out = *in
+	out.Scheme = target.Scheme
+	out.Host = target.Host
+	out.Path = joinURLPath(target.Path, in.Path)
+	out.RawPath = ""
+	return out
+}
+
+func joinURLPath(basePath, reqPath string) string {
+	if basePath == "" || basePath == "/" {
+		if reqPath == "" {
+			return "/"
+		}
+		return reqPath
+	}
+	if reqPath == "" {
+		return basePath
+	}
+	baseSlash := strings.HasSuffix(basePath, "/")
+	reqSlash := strings.HasPrefix(reqPath, "/")
+	if baseSlash && reqSlash {
+		return basePath + reqPath[1:]
+	}
+	if !baseSlash && !reqSlash {
+		return basePath + "/" + reqPath
+	}
+	return basePath + reqPath
+}
+
+func cleanProxyHeaders(req *http.Request) {
+	for k := range req.Header {
+		if _, drop := hopByHopHeaders[strings.ToLower(k)]; drop {
+			req.Header.Del(k)
+		}
+	}
+
+	req.Header.Del("Forwarded")
+	req.Header.Del("X-Forwarded-For")
+	req.Header.Del("X-Forwarded-Host")
+	req.Header.Del("X-Forwarded-Proto")
+
+	req.Header.Set("X-Forwarded-Host", req.Host)
+	if req.TLS != nil {
+		req.Header.Set("X-Forwarded-Proto", "https")
+	} else {
+		req.Header.Set("X-Forwarded-Proto", "http")
+	}
+	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil && strings.TrimSpace(host) != "" {
+		req.Header.Set("X-Forwarded-For", host)
+	}
+}
+
+func copyResponseHeaders(dst http.Header, src http.Header) {
+	for k, vv := range src {
+		if _, drop := hopByHopHeaders[strings.ToLower(k)]; drop {
+			continue
+		}
+		dst[k] = append([]string(nil), vv...)
+	}
+}
+
 // proxyForDestination 为解析后的上游地址返回可复用的反向代理实例。
 func (s *Server) proxyForDestination(destination string) (*httputil.ReverseProxy, error) {
 	destination = strings.TrimSpace(destination)
@@ -545,6 +674,38 @@ func (s *Server) proxyForDestination(destination string) (*httputil.ReverseProxy
 	s.mu.Unlock()
 
 	return proxy, nil
+}
+
+func (s *Server) targetForDestination(destination string) (*url.URL, error) {
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return nil, fmt.Errorf("route destination is empty")
+	}
+
+	s.mu.RLock()
+	target, ok := s.targets[destination]
+	s.mu.RUnlock()
+	if ok {
+		return target, nil
+	}
+
+	parsed, err := parseDestination(destination)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	if s.targets == nil {
+		s.targets = make(map[string]*url.URL)
+	}
+	if existing, exists := s.targets[destination]; exists {
+		s.mu.Unlock()
+		return existing, nil
+	}
+	s.targets[destination] = parsed
+	s.mu.Unlock()
+
+	return parsed, nil
 }
 
 // parseDestination 将 host:port 或 http(s) URL 规范化为上游 URL。

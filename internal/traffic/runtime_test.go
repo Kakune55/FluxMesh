@@ -514,3 +514,31 @@ func TestResolveDestinationsForAttemptsPrefersDirectBeforeRelay(t *testing.T) {
 		t.Fatalf("expected direct-first relay-fallback order, got %+v", candidates)
 	}
 }
+
+func TestMatchFallbackToWildcardWhenExactPathMisses(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "svc-a",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+			},
+			Routes: []model.ServiceRoute{
+				{Hosts: []string{"pay.example.com"}, PathPrefix: "/only", Destination: "127.0.0.1:28081", Weight: 100},
+				{Hosts: []string{"*"}, PathPrefix: "/", Destination: "127.0.0.1:28082", Weight: 80},
+			},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	result, ok := plan.Match("0.0.0.0", 18080, "pay.example.com", "/other")
+	if !ok {
+		t.Fatalf("expected wildcard fallback route")
+	}
+	if result.Destination != "127.0.0.1:28082" {
+		t.Fatalf("expected wildcard destination 127.0.0.1:28082, got %s", result.Destination)
+	}
+}

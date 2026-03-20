@@ -32,12 +32,18 @@ type ListenerPlan struct {
 
 type Plan struct {
 	listeners        map[string]ListenerPlan
+	listenerMatchers map[string]listenerMatcher
 	backendGroups    map[string]model.BackendGroup
 	backendRelayAddrs map[string]map[string]struct{}
 	backendStrategy  map[string]string
 	serviceListeners map[string]ListenerKey
 	servicePolicies  map[string]model.ServiceTrafficPolicy
 	state            *planState
+}
+
+type listenerMatcher struct {
+	exact    map[string][]RouteBinding
+	wildcard []RouteBinding
 }
 
 type MatchResult struct {
@@ -55,6 +61,7 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	backendStrategy := make(map[string]string)
 	serviceListeners := make(map[string]ListenerKey)
 	servicePolicies := make(map[string]model.ServiceTrafficPolicy)
+	listenerMatchers := make(map[string]listenerMatcher)
 
 	for i := range services {
 		cfg := services[i]
@@ -113,10 +120,12 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 			return lp.Routes[i].Destination < lp.Routes[j].Destination
 		})
 		listeners[key] = lp
+		listenerMatchers[key] = buildListenerMatcher(lp.Routes)
 	}
 
 	return Plan{
 		listeners:        listeners,
+		listenerMatchers: listenerMatchers,
 		backendGroups:    backendGroups,
 		backendRelayAddrs: backendRelayAddrs,
 		backendStrategy:  backendStrategy,
@@ -143,12 +152,23 @@ func (p Plan) Listeners() []ListenerPlan {
 
 // Match 在指定监听上下文内按 Host+Path 规则挑选最佳路由。
 func (p Plan) Match(addr string, port int, host string, path string) (MatchResult, bool) {
-	listener, ok := p.listeners[listenerMapKey(strings.TrimSpace(addr), port)]
+	key := listenerMapKey(strings.TrimSpace(addr), port)
+	listener, ok := p.listeners[key]
 	if !ok {
 		return MatchResult{}, false
 	}
 
 	host = normalizeHost(host)
+	if matcher, ok := p.listenerMatchers[key]; ok {
+		if matched, ok := bestRouteMatch(listener.Listener, matcher.exact[host], path, 2); ok {
+			return matched, true
+		}
+		if matched, ok := bestRouteMatch(listener.Listener, matcher.wildcard, path, 1); ok {
+			return matched, true
+		}
+		return MatchResult{}, false
+	}
+
 	bestScore := -1
 	best := MatchResult{}
 
@@ -177,6 +197,55 @@ func (p Plan) Match(addr string, port int, host string, path string) (MatchResul
 		return MatchResult{}, false
 	}
 	return best, true
+}
+
+func bestRouteMatch(listener ListenerKey, routes []RouteBinding, path string, hostScore int) (MatchResult, bool) {
+	bestScore := -1
+	best := MatchResult{}
+
+	for _, route := range routes {
+		if !strings.HasPrefix(path, route.PathPrefix) {
+			continue
+		}
+
+		score := hostScore*100000 + len(route.PathPrefix)*100 + route.Weight
+		if score > bestScore {
+			bestScore = score
+			best = MatchResult{
+				Listener:    listener,
+				ServiceName: route.ServiceName,
+				Destination: route.Destination,
+				PathPrefix:  route.PathPrefix,
+			}
+		}
+	}
+
+	if bestScore < 0 {
+		return MatchResult{}, false
+	}
+	return best, true
+}
+
+func buildListenerMatcher(routes []RouteBinding) listenerMatcher {
+	matcher := listenerMatcher{exact: make(map[string][]RouteBinding)}
+	for _, route := range routes {
+		wildcard := false
+		for _, host := range route.Hosts {
+			h := strings.ToLower(strings.TrimSpace(host))
+			if h == "" {
+				continue
+			}
+			if h == "*" {
+				wildcard = true
+				continue
+			}
+			matcher.exact[h] = append(matcher.exact[h], route)
+		}
+		if wildcard {
+			matcher.wildcard = append(matcher.wildcard, route)
+		}
+	}
+	return matcher
 }
 
 // ResolveDestination 将 destination 解析为可直连上游地址。
