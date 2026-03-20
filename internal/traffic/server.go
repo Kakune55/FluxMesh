@@ -3,6 +3,7 @@ package traffic
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -27,6 +28,7 @@ type Server struct {
 	plan      Plan
 	planValue atomic.Value
 	listeners map[string]*http.Server
+	tcpListeners map[string]net.Listener
 	proxies   map[string]*httputil.ReverseProxy
 	targets   map[string]*url.URL
 	transport *http.Transport
@@ -83,6 +85,7 @@ func NewServer(services *registry.Services) *Server {
 	s := &Server{
 		services:  services,
 		listeners: make(map[string]*http.Server),
+		tcpListeners: make(map[string]net.Listener),
 		proxies:   make(map[string]*httputil.ReverseProxy),
 		targets:   make(map[string]*url.URL),
 		transport: transport,
@@ -116,12 +119,22 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for _, srv := range s.listeners {
 		listeners = append(listeners, srv)
 	}
+	tcpListeners := make([]net.Listener, 0, len(s.tcpListeners))
+	for _, ln := range s.tcpListeners {
+		tcpListeners = append(tcpListeners, ln)
+	}
 	s.listeners = make(map[string]*http.Server)
+	s.tcpListeners = make(map[string]net.Listener)
 	s.mu.Unlock()
 
 	var firstErr error
 	for _, srv := range listeners {
 		if err := srv.Shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for _, ln := range tcpListeners {
+		if err := ln.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -162,6 +175,10 @@ func (s *Server) refresh(ctx context.Context) error {
 	for _, listener := range plan.Listeners() {
 		desired[listenerMapKey(listener.Listener.Addr, listener.Listener.Port)] = listener
 	}
+	desiredTCP := make(map[string]TCPBinding)
+	for _, binding := range plan.TCPBindings() {
+		desiredTCP[listenerMapKey(binding.Listener.Addr, binding.Listener.Port)] = binding
+	}
 
 	s.mu.Lock()
 	if s.plan.state != nil {
@@ -185,6 +202,16 @@ func (s *Server) refresh(ctx context.Context) error {
 		}(srv, key)
 	}
 
+	for key, ln := range s.tcpListeners {
+		if _, ok := desiredTCP[key]; ok {
+			continue
+		}
+		delete(s.tcpListeners, key)
+		if err := ln.Close(); err != nil {
+			logx.Warn("TCP 流量监听关闭失败", "listener", key, "err", err)
+		}
+	}
+
 	for key, listener := range desired {
 		if _, ok := s.listeners[key]; ok {
 			continue
@@ -206,9 +233,135 @@ func (s *Server) refresh(ctx context.Context) error {
 			}
 		}(srv, addr)
 	}
+
+	for key, binding := range desiredTCP {
+		if _, ok := s.tcpListeners[key]; ok {
+			continue
+		}
+
+		addr := net.JoinHostPort(binding.Listener.Addr, strconv.Itoa(binding.Listener.Port))
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			logx.Error("TCP 流量监听启动失败", "addr", addr, "err", err)
+			continue
+		}
+
+		s.tcpListeners[key] = ln
+		go s.acceptTCPLoop(binding.Listener, ln)
+		logx.Info("TCP 流量监听已启动", "addr", addr)
+	}
 	s.mu.Unlock()
 
 	return nil
+}
+
+func (s *Server) acceptTCPLoop(listener ListenerKey, ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logx.Warn("TCP 连接接入失败", "listener", listenerMapKey(listener.Addr, listener.Port), "err", err)
+			continue
+		}
+
+		go s.handleTCPConn(conn, listener)
+	}
+}
+
+func (s *Server) handleTCPConn(client net.Conn, listener ListenerKey) {
+	defer client.Close()
+
+	plan := s.currentPlan()
+	binding, ok := plan.TCPBinding(listener.Addr, listener.Port)
+	if !ok {
+		return
+	}
+
+	policy, _ := plan.ServicePolicy(binding.ServiceName)
+	maxAttempts := effectiveMaxAttempts(policy.Retry.MaxAttempts)
+	maxAttempts = applyRetryBudget(maxAttempts, policy.Retry.BudgetRatio)
+
+	candidates, err := plan.ResolveDestinationsForAttempts(binding.Destination, maxAttempts)
+	if err != nil {
+		logx.Warn("TCP 目标解析失败", "service", binding.ServiceName, "destination", binding.Destination, "err", err)
+		return
+	}
+
+	var lastErr error
+	for _, candidate := range candidates {
+		dialAddr, err := tcpDialAddress(candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		upstream, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		proxyTCP(client, upstream)
+		return
+	}
+
+	if lastErr != nil {
+		logx.Warn("TCP 上游连接失败", "service", binding.ServiceName, "destination", binding.Destination, "err", lastErr)
+	}
+}
+
+func tcpDialAddress(destination string) (string, error) {
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return "", fmt.Errorf("destination is empty")
+	}
+
+	if strings.Contains(destination, "://") {
+		u, err := url.Parse(destination)
+		if err != nil {
+			return "", fmt.Errorf("invalid destination url: %w", err)
+		}
+		if strings.TrimSpace(u.Host) == "" {
+			return "", fmt.Errorf("destination host is required")
+		}
+		if _, _, err := net.SplitHostPort(u.Host); err != nil {
+			return "", fmt.Errorf("destination host must be host:port")
+		}
+		return u.Host, nil
+	}
+
+	if _, _, err := net.SplitHostPort(destination); err != nil {
+		return "", fmt.Errorf("destination must be host:port")
+	}
+
+	return destination, nil
+}
+
+func proxyTCP(client net.Conn, upstream net.Conn) {
+	defer upstream.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(upstream, client)
+		if c, ok := upstream.(*net.TCPConn); ok {
+			_ = c.CloseWrite()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(client, upstream)
+		if c, ok := client.(*net.TCPConn); ok {
+			_ = c.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
 }
 
 // newListenerHandler 处理入站请求并完成匹配、解析和反向代理转发。

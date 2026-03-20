@@ -305,6 +305,64 @@ func TestResolveDestinationRandomStrategy(t *testing.T) {
 	}
 }
 
+func TestBuildPlanTCPBindings(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "tcp-gateway",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Proxy:    model.ProxyPolicy{Layer: "l4-tcp"},
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 19090},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:3306", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	if len(plan.Listeners()) != 0 {
+		t.Fatalf("expected 0 http listeners for pure tcp services")
+	}
+
+	tcpBindings := plan.TCPBindings()
+	if len(tcpBindings) != 1 {
+		t.Fatalf("expected 1 tcp binding, got %d", len(tcpBindings))
+	}
+	if tcpBindings[0].ServiceName != "tcp-gateway" {
+		t.Fatalf("unexpected tcp binding service: %s", tcpBindings[0].ServiceName)
+	}
+	if tcpBindings[0].Destination != "127.0.0.1:3306" {
+		t.Fatalf("unexpected tcp binding destination: %s", tcpBindings[0].Destination)
+	}
+}
+
+func TestBuildPlanRejectMixHTTPAndTCPOnSameListener(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "http-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:28081", Weight: 100}},
+		},
+		{
+			Name: "tcp-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Proxy:    model.ProxyPolicy{Layer: "l4-tcp"},
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:3306", Weight: 100}},
+		},
+	}
+
+	_, err := BuildPlan(services)
+	if err == nil {
+		t.Fatalf("expected mixed listener conflict error")
+	}
+}
+
 func TestResolveDestinationLatencyFirstStrategy(t *testing.T) {
 	services := []model.ServiceConfig{
 		{

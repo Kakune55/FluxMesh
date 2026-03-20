@@ -33,12 +33,19 @@ type ListenerPlan struct {
 type Plan struct {
 	listeners        map[string]ListenerPlan
 	listenerMatchers map[string]listenerMatcher
+	tcpBindings      map[string]TCPBinding
 	backendGroups    map[string]model.BackendGroup
 	backendRelayAddrs map[string]map[string]struct{}
 	backendStrategy  map[string]string
 	serviceListeners map[string]ListenerKey
 	servicePolicies  map[string]model.ServiceTrafficPolicy
 	state            *planState
+}
+
+type TCPBinding struct {
+	Listener    ListenerKey `json:"listener"`
+	ServiceName string      `json:"service_name"`
+	Destination string      `json:"destination"`
 }
 
 type listenerMatcher struct {
@@ -61,6 +68,7 @@ type MatchResult struct {
 // BuildPlan 将服务配置编译为监听视图、路由表和目标解析索引。
 func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	listeners := make(map[string]ListenerPlan)
+	tcpBindings := make(map[string]TCPBinding)
 	backendGroups := make(map[string]model.BackendGroup)
 	backendRelayAddrs := make(map[string]map[string]struct{})
 	backendStrategy := make(map[string]string)
@@ -94,6 +102,26 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 		}
 
 		key := listenerMapKey(cfg.TrafficPolicy.Listener.Addr, cfg.TrafficPolicy.Listener.Port)
+		layer := strings.ToLower(strings.TrimSpace(cfg.TrafficPolicy.Proxy.Layer))
+		if layer == "l4-tcp" {
+			if existing, ok := listeners[key]; ok && len(existing.Routes) > 0 {
+				return Plan{}, fmt.Errorf("listener %s cannot mix l4-tcp with l7-http routes", key)
+			}
+			if _, exists := tcpBindings[key]; exists {
+				return Plan{}, fmt.Errorf("listener %s already bound by another l4-tcp service", key)
+			}
+			tcpBindings[key] = TCPBinding{
+				Listener: ListenerKey{Addr: cfg.TrafficPolicy.Listener.Addr, Port: cfg.TrafficPolicy.Listener.Port},
+				ServiceName: cfg.Name,
+				Destination: cfg.Routes[0].Destination,
+			}
+			continue
+		}
+
+		if _, exists := tcpBindings[key]; exists {
+			return Plan{}, fmt.Errorf("listener %s cannot mix l7-http with l4-tcp service", key)
+		}
+
 		lp := listeners[key]
 		if lp.Listener.Port == 0 {
 			lp.Listener = ListenerKey{Addr: cfg.TrafficPolicy.Listener.Addr, Port: cfg.TrafficPolicy.Listener.Port}
@@ -131,6 +159,7 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	return Plan{
 		listeners:        listeners,
 		listenerMatchers: listenerMatchers,
+		tcpBindings:      tcpBindings,
 		backendGroups:    backendGroups,
 		backendRelayAddrs: backendRelayAddrs,
 		backendStrategy:  backendStrategy,
@@ -138,6 +167,31 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 		servicePolicies:  servicePolicies,
 		state:            newPlanState(),
 	}, nil
+}
+
+// TCPBindings 返回按地址端口排序后的 TCP 监听绑定快照。
+func (p Plan) TCPBindings() []TCPBinding {
+	items := make([]TCPBinding, 0, len(p.tcpBindings))
+	for _, binding := range p.tcpBindings {
+		items = append(items, binding)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Listener.Addr != items[j].Listener.Addr {
+			return items[i].Listener.Addr < items[j].Listener.Addr
+		}
+		return items[i].Listener.Port < items[j].Listener.Port
+	})
+	return items
+}
+
+// TCPBinding 返回指定监听对应的 TCP 绑定。
+func (p Plan) TCPBinding(addr string, port int) (TCPBinding, bool) {
+	key := listenerMapKey(strings.TrimSpace(addr), port)
+	binding, ok := p.tcpBindings[key]
+	if !ok {
+		return TCPBinding{}, false
+	}
+	return binding, true
 }
 
 // Listeners 返回按地址端口排序后的监听规划快照。

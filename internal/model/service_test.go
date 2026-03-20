@@ -232,3 +232,37 @@ func TestServiceConfigValidateObservabilitySampleRate(t *testing.T) {
 		t.Fatalf("expected validation error for too large metrics sample rate")
 	}
 }
+
+func TestServiceConfigApplyDefaultsL4TCP(t *testing.T) {
+	cfg := ServiceConfig{
+		Name: "tcp-gateway",
+		TrafficPolicy: ServiceTrafficPolicy{
+			Proxy:    ProxyPolicy{Layer: "l4-tcp"},
+			Listener: ListenerPolicy{Port: 19090},
+		},
+		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:3306"}},
+	}
+
+	cfg.ApplyDefaults()
+
+	if len(cfg.TrafficPolicy.Protocols) != 1 || cfg.TrafficPolicy.Protocols[0] != "tcp" {
+		t.Fatalf("expected protocol default [tcp] for l4-tcp, got %+v", cfg.TrafficPolicy.Protocols)
+	}
+}
+
+func TestServiceConfigValidateL4ProtocolMismatch(t *testing.T) {
+	cfg := ServiceConfig{
+		Name: "tcp-gateway",
+		TrafficPolicy: ServiceTrafficPolicy{
+			Proxy:     ProxyPolicy{Layer: "l4-tcp"},
+			Protocols: []string{"http"},
+			Listener:  ListenerPolicy{Port: 19090},
+		},
+		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:3306", Weight: 100}},
+	}
+
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for l4-tcp protocol mismatch")
+	}
+}

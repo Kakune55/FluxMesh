@@ -49,7 +49,7 @@ ServiceConfig 关键字段：
 
 - listener.addr = 0.0.0.0
 - proxy.layer = l7-http
-- protocols = [http]
+- protocols = [http]（proxy.layer=l7-http）或 [tcp]（proxy.layer=l4-tcp）
 - observability.metrics_sample_rate = 1
 - routes[].hosts = [*]
 - routes[].weight = 100
@@ -61,7 +61,7 @@ ServiceConfig 关键字段：
 - listener.port 范围为 1 到 65535
 - listener.addr 必须是可绑定 IPv4
 - proxy.layer 仅允许 l7-http 或 l4-tcp
-- protocols 至少一个，且 MVP 仅允许 http
+- protocols 至少一个，且按 proxy.layer 校验：l7-http 仅允许 http，l4-tcp 仅允许 tcp
 - lb.strategy 允许内置策略与别名，也允许匹配 [a-z0-9-] 的自定义名
 - observability.metrics_sample_rate 范围为 1 到 10000
 - routes 至少一个
@@ -79,9 +79,15 @@ BuildPlan 过程：
 
 1. 对每个服务执行 defaults + validate。
 2. 以 listener.addr + listener.port 作为监听合并键。
-3. 将路由展平成 RouteBinding 并归并到监听维度。
-4. 预构建 Host 匹配桶：exact host 与 wildcard host。
-5. 为 backend_group 记录策略和 relay 候选索引。
+3. 若 proxy.layer=l7-http：将路由展平成 RouteBinding 并归并到 HTTP 监听维度。
+4. 若 proxy.layer=l4-tcp：生成 TCPBinding（每监听仅允许一个 l4-tcp 服务绑定）。
+5. 预构建 Host 匹配桶：exact host 与 wildcard host（仅 HTTP）。
+6. 为 backend_group 记录策略和 relay 候选索引。
+
+监听冲突规则：
+
+- 同一 listener.addr + listener.port 不允许 l7-http 与 l4-tcp 混用。
+- 同一 listener.addr + listener.port 不允许绑定多个 l4-tcp 服务。
 
 ### 3.2 匹配优先级
 
@@ -120,6 +126,15 @@ BuildPlan 过程：
   - latency-first：当前与 load-first 一致（预留）
 
 ## 5. 转发与重试
+
+### 5.0 L4-TCP 转发路径
+
+当 proxy.layer=l4-tcp：
+
+- 运行时建立 TCP listener，并基于监听键查找 TCPBinding。
+- destination 解析后得到候选地址，按重试预算顺序尝试拨号。
+- 成功后进行双向字节流转发（io.Copy 双协程）。
+- 当前为纯透传模式，不参与 Host/Path 匹配。
 
 ### 5.1 单尝试路径
 
@@ -204,6 +219,7 @@ BuildPlan 过程：
 
 - 服务级监听声明与同端口复用
 - Host + Path 路由匹配
+- L4-TCP 基础代理透传（listener 绑定 + 连接转发）
 - backend group + 直连 + 服务名回落三类 destination
 - 负载策略插件化注册机制
 - 重试预算与 relay 候选切换
@@ -213,4 +229,79 @@ BuildPlan 过程：
 
 - 全局 traffic 配置层（当前仅服务级）
 - 真正的 latency-first 指标驱动打分
-- 非 HTTP 协议转发（l4-tcp 仅字段预留）
+- gRPC 等更高层协议治理能力
+- L4 高级能力（如 SNI/四元组路由、连接级熔断）
+
+## 10. 配置示例
+
+### 10.1 最小 L4-TCP 透传
+
+```json
+{
+  "name": "mysql-tcp-gateway",
+  "routes": [
+    {
+      "path_prefix": "/",
+      "destination": "10.10.0.12:3306",
+      "weight": 100
+    }
+  ],
+  "traffic_policy": {
+    "proxy": {
+      "layer": "l4-tcp"
+    },
+    "protocols": ["tcp"],
+    "listener": {
+      "addr": "0.0.0.0",
+      "port": 23306
+    }
+  }
+}
+```
+
+### 10.2 使用 backend_groups 与重试策略
+
+```json
+{
+  "name": "redis-tcp-gateway",
+  "backend_groups": [
+    {
+      "name": "redis-primary",
+      "targets": [
+        {
+          "addr": "10.20.0.21:6379",
+          "weight": 100
+        },
+        {
+          "addr": "10.20.0.22:6379",
+          "weight": 80
+        }
+      ]
+    }
+  ],
+  "routes": [
+    {
+      "path_prefix": "/",
+      "destination": "redis-primary",
+      "weight": 100
+    }
+  ],
+  "traffic_policy": {
+    "proxy": {
+      "layer": "l4-tcp"
+    },
+    "protocols": ["tcp"],
+    "listener": {
+      "addr": "0.0.0.0",
+      "port": 26379
+    },
+    "lb": {
+      "strategy": "round-robin"
+    },
+    "retry": {
+      "max_attempts": 2,
+      "budget_ratio": 1
+    }
+  }
+}
+```

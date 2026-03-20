@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -119,6 +120,65 @@ func TestNewReverseProxyRewriteSecurityHeaders(t *testing.T) {
 	}
 	if payload["upstream_host_header"] != target.Host {
 		t.Fatalf("expected upstream Host header %q, got %q", target.Host, payload["upstream_host_header"])
+	}
+}
+
+func TestHandleTCPConnProxy(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start tcp upstream: %v", err)
+	}
+	defer upstream.Close()
+
+	go func() {
+		for {
+			conn, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 128)
+				n, readErr := c.Read(buf)
+				if readErr != nil {
+					return
+				}
+				_, _ = c.Write([]byte("echo:" + string(buf[:n])))
+			}(conn)
+		}
+	}()
+
+	plan, err := BuildPlan([]model.ServiceConfig{{
+		Name: "tcp-gateway",
+		TrafficPolicy: model.ServiceTrafficPolicy{
+			Proxy:    model.ProxyPolicy{Layer: "l4-tcp"},
+			Listener: model.ListenerPolicy{Addr: "127.0.0.1", Port: 19090},
+		},
+		Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: upstream.Addr().String(), Weight: 100}},
+	}})
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	s := &Server{plan: plan, listeners: map[string]*http.Server{}, proxies: map[string]*httputil.ReverseProxy{}}
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go s.handleTCPConn(server, ListenerKey{Addr: "127.0.0.1", Port: 19090})
+
+	if _, err := client.Write([]byte("ping")); err != nil {
+		t.Fatalf("write to proxy failed: %v", err)
+	}
+
+	out := make([]byte, 64)
+	n, err := io.ReadAtLeast(client, out, len("echo:ping"))
+	if err != nil {
+		t.Fatalf("read from proxy failed: %v", err)
+	}
+
+	if string(out[:n]) != "echo:ping" {
+		t.Fatalf("unexpected tcp proxy response: %s", string(out[:n]))
 	}
 }
 

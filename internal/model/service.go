@@ -83,7 +83,11 @@ func (s *ServiceConfig) ApplyDefaults() {
 	}
 
 	if len(s.TrafficPolicy.Protocols) == 0 {
-		s.TrafficPolicy.Protocols = []string{"http"}
+		if strings.EqualFold(strings.TrimSpace(s.TrafficPolicy.Proxy.Layer), "l4-tcp") {
+			s.TrafficPolicy.Protocols = []string{"tcp"}
+		} else {
+			s.TrafficPolicy.Protocols = []string{"http"}
+		}
 	}
 
 	if s.TrafficPolicy.Observability.MetricsSampleRate <= 0 {
@@ -142,8 +146,18 @@ func (s ServiceConfig) Validate() error {
 		return fmt.Errorf("traffic_policy.protocols must include at least one protocol")
 	}
 	for i, protocol := range s.TrafficPolicy.Protocols {
-		if strings.TrimSpace(protocol) != "http" {
-			return fmt.Errorf("traffic_policy.protocols[%d] only supports http in MVP", i)
+		p := strings.ToLower(strings.TrimSpace(protocol))
+		switch layer {
+		case "l7-http":
+			if p != "http" {
+				return fmt.Errorf("traffic_policy.protocols[%d] only supports http when proxy.layer=l7-http", i)
+			}
+		case "l4-tcp":
+			if p != "tcp" {
+				return fmt.Errorf("traffic_policy.protocols[%d] only supports tcp when proxy.layer=l4-tcp", i)
+			}
+		default:
+			return fmt.Errorf("traffic_policy.proxy.layer must be l7-http or l4-tcp")
 		}
 	}
 
