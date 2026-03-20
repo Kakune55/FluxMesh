@@ -33,6 +33,11 @@ services:
     networks:
       - fluxmesh
     profiles: ["s1a", "3s", "scale"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
 
   # profile: s1a
   agent-1:
@@ -53,6 +58,11 @@ services:
     networks:
       - fluxmesh
     profiles: ["s1a"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
 
   # profile: 3s
   server-2:
@@ -82,6 +92,11 @@ services:
     networks:
       - fluxmesh
     profiles: ["3s", "scale"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
 
   # profile: 3s
   server-3:
@@ -113,6 +128,11 @@ services:
     networks:
       - fluxmesh
     profiles: ["3s", "scale"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
 
   # profile: scale
   # 使用 --scale agent-scale=N 启动大规模 agent 压测。
@@ -136,6 +156,11 @@ services:
     networks:
       - fluxmesh
     profiles: ["scale"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
 
 networks:
   fluxmesh:

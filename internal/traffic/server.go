@@ -8,7 +8,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
@@ -34,6 +33,17 @@ type Server struct {
 	metrics   trafficMetrics
 	metricsSampleRate atomic.Uint32
 	metricsSampleSeq  atomic.Uint64
+	metricsEvents chan metricsEvent
+	metricsStop   chan struct{}
+	metricsStarted atomic.Bool
+	metricsWG     sync.WaitGroup
+}
+
+type metricsEvent struct {
+	weight         uint64
+	retryAttempts  uint64
+	relayHit       bool
+	relayLatencyNs uint64
 }
 
 type trafficMetrics struct {
@@ -76,6 +86,8 @@ func NewServer(services *registry.Services) *Server {
 		proxies:   make(map[string]*httputil.ReverseProxy),
 		targets:   make(map[string]*url.URL),
 		transport: transport,
+		metricsEvents: make(chan metricsEvent, 8192),
+		metricsStop:   make(chan struct{}),
 	}
 	s.planValue.Store(Plan{})
 	s.metricsSampleRate.Store(1)
@@ -91,6 +103,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.refresh(ctx); err != nil {
 		return err
 	}
+	s.startMetricsAggregator()
 
 	go s.reconcileLoop(ctx)
 	return nil
@@ -112,6 +125,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	s.stopMetricsAggregator()
 	return firstErr
 }
 
@@ -209,7 +223,7 @@ func (s *Server) newListenerHandler(listener ListenerKey) http.Handler {
 func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener ListenerKey) (int, int, bool, uint32) {
 	host := r.Host
 	path := r.URL.Path
-	if strings.TrimSpace(path) == "" {
+	if path == "" {
 		path = "/"
 	}
 
@@ -331,13 +345,16 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		attemptReq.Header.Set(headerFluxMeshUpstream, resolved)
 		attemptReq.Header.Set(headerFluxMeshHops, strconv.Itoa(incomingHops+1))
 
-		rr := httptest.NewRecorder()
-		proxy.ServeHTTP(rr, attemptReq)
+		rw := acquireRetryBufferWriter()
+		proxy.ServeHTTP(rw, attemptReq)
+		statusCode := rw.StatusCode()
 
-		if !shouldRetryStatus(rr.Code) || attempt == len(candidates)-1 {
-			writeRecordedResponse(w, rr)
-			return rr.Code, attempt + 1, relayHit, sampleRate
+		if !shouldRetryStatus(statusCode) || attempt == len(candidates)-1 {
+			writeRetryBufferedResponse(w, rw)
+			releaseRetryBufferWriter(rw)
+			return statusCode, attempt + 1, relayHit, sampleRate
 		}
+		releaseRetryBufferWriter(rw)
 	}
 
 	http.Error(w, "upstream proxy error: no candidate executed", http.StatusBadGateway)
@@ -380,13 +397,60 @@ func (s *Server) recordTrafficMetrics(elapsed time.Duration, statusCode int, att
 		s.metrics.errorTotal.Add(weight)
 	}
 
-	if attemptsUsed > 1 {
-		s.metrics.retryAttemptsTotal.Add(uint64(attemptsUsed-1) * weight)
-	}
+	if attemptsUsed > 1 || relayHit {
+		evt := metricsEvent{weight: weight}
+		if attemptsUsed > 1 {
+			evt.retryAttempts = uint64(attemptsUsed - 1)
+		}
+		if relayHit {
+			evt.relayHit = true
+			evt.relayLatencyNs = uint64(elapsed.Nanoseconds())
+		}
 
-	if relayHit {
-		s.metrics.relayHitTotal.Add(weight)
-		s.metrics.relayLatencyNs.Add(uint64(elapsed.Nanoseconds()) * weight)
+		if s.metricsStarted.Load() {
+			select {
+			case s.metricsEvents <- evt:
+			default:
+			}
+		} else {
+			s.applyMetricsEvent(evt)
+		}
+	}
+}
+
+func (s *Server) startMetricsAggregator() {
+	if !s.metricsStarted.CompareAndSwap(false, true) {
+		return
+	}
+	s.metricsWG.Add(1)
+	go func() {
+		defer s.metricsWG.Done()
+		for {
+			select {
+			case <-s.metricsStop:
+				return
+			case evt := <-s.metricsEvents:
+				s.applyMetricsEvent(evt)
+			}
+		}
+	}()
+}
+
+func (s *Server) stopMetricsAggregator() {
+	if !s.metricsStarted.CompareAndSwap(true, false) {
+		return
+	}
+	close(s.metricsStop)
+	s.metricsWG.Wait()
+}
+
+func (s *Server) applyMetricsEvent(evt metricsEvent) {
+	if evt.retryAttempts > 0 {
+		s.metrics.retryAttemptsTotal.Add(evt.retryAttempts * evt.weight)
+	}
+	if evt.relayHit {
+		s.metrics.relayHitTotal.Add(evt.weight)
+		s.metrics.relayLatencyNs.Add(evt.relayLatencyNs * evt.weight)
 	}
 }
 
@@ -517,14 +581,66 @@ func shouldRetryStatus(statusCode int) bool {
 	return statusCode >= http.StatusBadGateway
 }
 
-func writeRecordedResponse(w http.ResponseWriter, rr *httptest.ResponseRecorder) {
-	for k, values := range rr.Header() {
+type retryBufferWriter struct {
+	header      http.Header
+	body        bytes.Buffer
+	statusCode  int
+	wroteHeader bool
+}
+
+var retryBufferPool = sync.Pool{New: func() any {
+	return &retryBufferWriter{header: make(http.Header)}
+}}
+
+func acquireRetryBufferWriter() *retryBufferWriter {
+	w := retryBufferPool.Get().(*retryBufferWriter)
+	for k := range w.header {
+		delete(w.header, k)
+	}
+	w.body.Reset()
+	w.statusCode = 0
+	w.wroteHeader = false
+	return w
+}
+
+func releaseRetryBufferWriter(w *retryBufferWriter) {
+	retryBufferPool.Put(w)
+}
+
+func (w *retryBufferWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *retryBufferWriter) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.statusCode = code
+}
+
+func (w *retryBufferWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.body.Write(p)
+}
+
+func (w *retryBufferWriter) StatusCode() int {
+	if w.statusCode == 0 {
+		return http.StatusOK
+	}
+	return w.statusCode
+}
+
+func writeRetryBufferedResponse(out http.ResponseWriter, in *retryBufferWriter) {
+	for k, values := range in.Header() {
 		for _, v := range values {
-			w.Header().Add(k, v)
+			out.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(rr.Code)
-	_, _ = w.Write(rr.Body.Bytes())
+	out.WriteHeader(in.StatusCode())
+	_, _ = out.Write(in.body.Bytes())
 }
 
 type statusCaptureWriter struct {

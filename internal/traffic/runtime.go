@@ -42,8 +42,13 @@ type Plan struct {
 }
 
 type listenerMatcher struct {
-	exact    map[string][]RouteBinding
-	wildcard []RouteBinding
+	exact    map[string]pathMatcher
+	wildcard pathMatcher
+}
+
+type pathMatcher struct {
+	root    []RouteBinding
+	byFirst [256][]RouteBinding
 }
 
 type MatchResult struct {
@@ -160,10 +165,10 @@ func (p Plan) Match(addr string, port int, host string, path string) (MatchResul
 
 	host = normalizeHost(host)
 	if matcher, ok := p.listenerMatchers[key]; ok {
-		if matched, ok := bestRouteMatch(listener.Listener, matcher.exact[host], path, 2); ok {
+		if matched, ok := matchPathMatcher(listener.Listener, matcher.exact[host], path, 2); ok {
 			return matched, true
 		}
-		if matched, ok := bestRouteMatch(listener.Listener, matcher.wildcard, path, 1); ok {
+		if matched, ok := matchPathMatcher(listener.Listener, matcher.wildcard, path, 1); ok {
 			return matched, true
 		}
 		return MatchResult{}, false
@@ -226,10 +231,47 @@ func bestRouteMatch(listener ListenerKey, routes []RouteBinding, path string, ho
 	return best, true
 }
 
+func matchPathMatcher(listener ListenerKey, matcher pathMatcher, path string, hostScore int) (MatchResult, bool) {
+	bestScore := -1
+	best := MatchResult{}
+
+	key := pathFirstByte(path)
+	if key != 0 {
+		bestScore, best = bestRouteMatchSeed(listener, matcher.byFirst[key], path, hostScore, bestScore, best)
+	}
+	bestScore, best = bestRouteMatchSeed(listener, matcher.root, path, hostScore, bestScore, best)
+
+	if bestScore < 0 {
+		return MatchResult{}, false
+	}
+	return best, true
+}
+
+func bestRouteMatchSeed(listener ListenerKey, routes []RouteBinding, path string, hostScore int, bestScore int, best MatchResult) (int, MatchResult) {
+	for _, route := range routes {
+		if !strings.HasPrefix(path, route.PathPrefix) {
+			continue
+		}
+
+		score := hostScore*100000 + len(route.PathPrefix)*100 + route.Weight
+		if score > bestScore {
+			bestScore = score
+			best = MatchResult{
+				Listener:    listener,
+				ServiceName: route.ServiceName,
+				Destination: route.Destination,
+				PathPrefix:  route.PathPrefix,
+			}
+		}
+	}
+	return bestScore, best
+}
+
 func buildListenerMatcher(routes []RouteBinding) listenerMatcher {
-	matcher := listenerMatcher{exact: make(map[string][]RouteBinding)}
+	matcher := listenerMatcher{exact: make(map[string]pathMatcher)}
 	for _, route := range routes {
 		wildcard := false
+		pathKey := pathFirstByte(route.PathPrefix)
 		for _, host := range route.Hosts {
 			h := strings.ToLower(strings.TrimSpace(host))
 			if h == "" {
@@ -239,13 +281,30 @@ func buildListenerMatcher(routes []RouteBinding) listenerMatcher {
 				wildcard = true
 				continue
 			}
-			matcher.exact[h] = append(matcher.exact[h], route)
+			bucket := matcher.exact[h]
+			if pathKey == 0 {
+				bucket.root = append(bucket.root, route)
+			} else {
+				bucket.byFirst[pathKey] = append(bucket.byFirst[pathKey], route)
+			}
+			matcher.exact[h] = bucket
 		}
 		if wildcard {
-			matcher.wildcard = append(matcher.wildcard, route)
+			if pathKey == 0 {
+				matcher.wildcard.root = append(matcher.wildcard.root, route)
+			} else {
+				matcher.wildcard.byFirst[pathKey] = append(matcher.wildcard.byFirst[pathKey], route)
+			}
 		}
 	}
 	return matcher
+}
+
+func pathFirstByte(path string) byte {
+	if len(path) < 2 || path[0] != '/' {
+		return 0
+	}
+	return path[1]
 }
 
 // ResolveDestination 将 destination 解析为可直连上游地址。
