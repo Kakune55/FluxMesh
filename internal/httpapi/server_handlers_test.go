@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,6 +16,17 @@ import (
 	"fluxmesh/internal/softkv"
 	"fluxmesh/internal/testutil/etcdtest"
 )
+
+func mustAllocateTCPAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate tcp addr: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
 
 func TestParseExpectedRevision(t *testing.T) {
 	tests := []struct {
@@ -472,6 +484,150 @@ func TestHandleTrafficPlanAndMatch(t *testing.T) {
 		s.handleTrafficMatch(w, req)
 		if w.Code != http.StatusBadGateway {
 			t.Fatalf("expected %d, got %d, body=%s", http.StatusBadGateway, w.Code, w.Body.String())
+		}
+	})
+}
+
+func TestNewServerAndHandleHealth(t *testing.T) {
+	s := NewServer("127.0.0.1:0", nil, nil, nil, "v-test")
+	if s == nil || s.httpServer == nil || s.httpServer.Handler == nil {
+		t.Fatalf("expected initialized http server")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	s.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected %d, got %d", http.StatusOK, w.Code)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode health payload failed: %v", err)
+	}
+	if payload["status"] != "UP" || payload["version"] != "v-test" {
+		t.Fatalf("unexpected health payload: %+v", payload)
+	}
+}
+
+func TestServerStartAndShutdown(t *testing.T) {
+	addr := mustAllocateTCPAddr(t)
+	s := NewServer(addr, nil, nil, nil, "v-test")
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	var lastErr error
+	for i := 0; i < 20; i++ {
+		resp, err := http.Get("http://" + addr + "/health")
+		if err == nil {
+			_ = resp.Body.Close()
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatalf("server did not become ready: %v", lastErr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+}
+
+func TestHandleClusterStatus(t *testing.T) {
+	t.Run("method not allowed", func(t *testing.T) {
+		s := &Server{}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/cluster/status", nil)
+		w := httptest.NewRecorder()
+		s.handleClusterStatus(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected %d, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+
+	t.Run("ok", func(t *testing.T) {
+		emb := etcdtest.Start(t)
+		s := &Server{nodes: registry.NewService(emb.Client)}
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster/status", nil)
+		w := httptest.NewRecorder()
+		s.handleClusterStatus(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d body=%s", http.StatusOK, w.Code, w.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode cluster status payload failed: %v", err)
+		}
+		if payload["endpoint"] == "" {
+			t.Fatalf("expected non-empty endpoint in status payload")
+		}
+	})
+}
+
+func TestHandlerInternalErrorPaths(t *testing.T) {
+	emb := etcdtest.Start(t)
+	nodesSvc := registry.NewService(emb.Client)
+	services := registry.NewServices(emb.Client)
+	s := &Server{nodes: nodesSvc, services: services}
+
+	t.Run("handleNodes method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/nodes", nil)
+		w := httptest.NewRecorder()
+		s.handleNodes(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected %d, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+
+	t.Run("handleNodes internal error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil).WithContext(ctx)
+		w := httptest.NewRecorder()
+		s.handleNodes(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected %d, got %d", http.StatusInternalServerError, w.Code)
+		}
+	})
+
+	t.Run("handleServices get internal error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/services", nil).WithContext(ctx)
+		w := httptest.NewRecorder()
+		s.handleServices(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected %d, got %d", http.StatusInternalServerError, w.Code)
+		}
+	})
+
+	t.Run("handleServiceByName get internal error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/services/any", nil).WithContext(ctx)
+		w := httptest.NewRecorder()
+		s.handleServiceByName(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected %d, got %d", http.StatusInternalServerError, w.Code)
+		}
+	})
+
+	t.Run("handleServiceByName delete internal error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/services/any", nil).WithContext(ctx)
+		w := httptest.NewRecorder()
+		s.handleServiceByName(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected %d, got %d", http.StatusInternalServerError, w.Code)
 		}
 	})
 }

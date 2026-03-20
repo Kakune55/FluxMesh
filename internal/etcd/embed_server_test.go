@@ -38,8 +38,8 @@ func TestStartEmbeddedServerInvalidURLs(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		mutate  func(*config.Config)
+		name     string
+		mutate   func(*config.Config)
 		contains string
 	}{
 		{

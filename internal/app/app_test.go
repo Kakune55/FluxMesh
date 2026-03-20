@@ -16,6 +16,8 @@ import (
 	"fluxmesh/internal/softkv"
 	"fluxmesh/internal/sysmetrics"
 	"fluxmesh/internal/testutil/etcdtest"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 type fakeMetricsCollector struct {
@@ -74,6 +76,29 @@ func TestRound2(t *testing.T) {
 	}
 }
 
+func TestNewNonAuto(t *testing.T) {
+	cfg := config.Config{
+		NodeID:          "n1",
+		IP:              "127.0.0.1",
+		ClientListenURL: "http://0.0.0.0:2379",
+		PeerListenURL:   "http://0.0.0.0:2380",
+	}
+
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new app failed: %v", err)
+	}
+	if a == nil || a.softStore == nil || a.softBus == nil || a.softWriter == nil || a.reconciler == nil || a.metrics == nil {
+		t.Fatalf("expected initialized app dependencies")
+	}
+	if a.cfg.ClientAdvertiseURL != "http://127.0.0.1:2379" {
+		t.Fatalf("unexpected client advertise url: %s", a.cfg.ClientAdvertiseURL)
+	}
+	if a.cfg.PeerAdvertiseURL != "http://127.0.0.1:2380" {
+		t.Fatalf("unexpected peer advertise url: %s", a.cfg.PeerAdvertiseURL)
+	}
+}
+
 func TestNewClientValidation(t *testing.T) {
 	cli, err := newClient(nil)
 	if err == nil {
@@ -96,6 +121,17 @@ func TestNewClientSuccess(t *testing.T) {
 	t.Cleanup(func() {
 		_ = cli.Close()
 	})
+}
+
+func TestLeaseAccessors(t *testing.T) {
+	ch := make(chan *clientv3.LeaseKeepAliveResponse)
+	a := &App{leaseID: 99, keepAliveCh: ch}
+	if got := a.currentLeaseID(); got != 99 {
+		t.Fatalf("expected lease id 99, got %d", got)
+	}
+	if got := a.currentKeepAliveCh(); got != ch {
+		t.Fatalf("expected keepalive channel accessor to return same channel")
+	}
 }
 
 func TestDiscoverGossipPeers(t *testing.T) {
@@ -391,6 +427,51 @@ func TestWaitBackoffWithContext(t *testing.T) {
 			t.Fatalf("expected context canceled, got %v", err)
 		}
 	})
+}
+
+func TestConsumeKeepAliveAndMonitorContextCancel(t *testing.T) {
+	t.Run("consume keepalive exits on canceled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		done := make(chan struct{})
+		go func() {
+			(&App{keepAliveCh: make(chan *clientv3.LeaseKeepAliveResponse)}).consumeKeepAlive(ctx)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("consumeKeepAlive should exit quickly on canceled context")
+		}
+	})
+
+	t.Run("monitor metrics exits on canceled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		done := make(chan struct{})
+		go func() {
+			(&App{}).monitorNodeMetrics(ctx)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("monitorNodeMetrics should exit quickly on canceled context")
+		}
+	})
+}
+
+func TestShutdownNoDependencies(t *testing.T) {
+	a := &App{}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.Shutdown(ctx); err != nil {
+		t.Fatalf("expected shutdown without dependencies to succeed, got %v", err)
+	}
 }
 
 func TestRunSoftKVBus(t *testing.T) {

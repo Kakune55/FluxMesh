@@ -59,19 +59,19 @@ func TestConfigValidateInvalidBasics(t *testing.T) {
 	}{
 		{
 			name: "invalid role",
-			cfg: Config{Role: Role("bad"), NodeID: "n1", LeaseTTLSeconds: 10},
+			cfg:  Config{Role: Role("bad"), NodeID: "n1", LeaseTTLSeconds: 10},
 		},
 		{
 			name: "invalid cluster state for server",
-			cfg: Config{Role: RoleServer, ClusterState: ClusterState("bad"), NodeID: "n1", LeaseTTLSeconds: 10},
+			cfg:  Config{Role: RoleServer, ClusterState: ClusterState("bad"), NodeID: "n1", LeaseTTLSeconds: 10},
 		},
 		{
 			name: "missing node id",
-			cfg: Config{Role: RoleServer, ClusterState: ClusterStateNew, LeaseTTLSeconds: 10},
+			cfg:  Config{Role: RoleServer, ClusterState: ClusterStateNew, LeaseTTLSeconds: 10},
 		},
 		{
 			name: "invalid lease ttl",
-			cfg: Config{Role: RoleServer, ClusterState: ClusterStateNew, NodeID: "n1", LeaseTTLSeconds: 0},
+			cfg:  Config{Role: RoleServer, ClusterState: ClusterStateNew, NodeID: "n1", LeaseTTLSeconds: 0},
 		},
 	}
 

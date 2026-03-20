@@ -98,11 +98,9 @@ func (a *App) Run(parent context.Context) error {
 	a.cancel = cancel
 
 	// 后台执行 Pending-Reconcile 任务，兜底清理失败成员。
-	a.backgroundWG.Add(1)
-	go func() {
-		defer a.backgroundWG.Done()
+	a.backgroundWG.Go(func() {
 		a.reconciler.Run(ctx)
-	}()
+	})
 
 	if err := a.startEtcdAndClient(ctx); err != nil {
 		cancel()
