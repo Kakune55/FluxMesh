@@ -210,4 +210,25 @@ func TestServiceConfigApplyDefaults(t *testing.T) {
 	if cfg.BackendGroups[0].Targets[0].Weight != 100 {
 		t.Fatalf("expected backend target weight default 100, got %d", cfg.BackendGroups[0].Targets[0].Weight)
 	}
+	if cfg.TrafficPolicy.Observability.MetricsSampleRate != 1 {
+		t.Fatalf("expected observability sample rate default 1, got %d", cfg.TrafficPolicy.Observability.MetricsSampleRate)
+	}
+}
+
+func TestServiceConfigValidateObservabilitySampleRate(t *testing.T) {
+	cfg := ServiceConfig{
+		Name: "payment-svc",
+		TrafficPolicy: ServiceTrafficPolicy{
+			Listener: ListenerPolicy{Port: 18080},
+			Observability: ObservabilityPolicy{
+				MetricsSampleRate: 10001,
+			},
+		},
+		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+	}
+
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for too large metrics sample rate")
+	}
 }

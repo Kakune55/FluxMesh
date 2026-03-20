@@ -140,6 +140,7 @@ MVP 建议默认值：
 | `retry.max_attempts` | `int` | 可选 | 继承全局 | 建议不超过 `2`。 |
 | `retry.budget_ratio` | `float` | 可选 | 继承全局 | 服务级重试预算。 |
 | `relay.max_hops` | `int` | 可选 | 继承全局 | 服务级中继跳数覆盖。 |
+| `observability.metrics_sample_rate` | `int` | 可选 | `1` | 请求级观测采样率。`1` 表示全量采样；`N` 表示约每 `N` 个请求采样一次并按权重回填统计。 |
 
 路由字段（`routes[]`）：
 
@@ -159,6 +160,7 @@ MVP 建议默认值：
 - 多个服务声明相同 `listener.addr + listener.port` 时，运行时必须复用同一个监听 socket。
 - 多个服务共享同地址同端口时，必须可通过 `hosts` 或 `path_prefix` 稳定区分路由。
 - `relay.max_hops` 取值建议 `1` 到 `4`，默认 `2`。
+- `observability.metrics_sample_rate` 取值范围为 `1` 到 `10000`，默认 `1`。
 - `routes[].hosts` 未配置时按 `*` 处理。
 - `proxy.layer=l7-http` 时需要 `routes[]`；`l4-tcp` 预留为后续扩展。
 - `routes[].destination` 必须能解析到已存在的后端组或服务。
@@ -228,6 +230,9 @@ MVP 建议默认值：
     "retry": {
       "max_attempts": 2,
       "budget_ratio": 0.15
+    },
+    "observability": {
+      "metrics_sample_rate": 8
     },
     "relay": {
       "max_hops": 3
@@ -302,6 +307,7 @@ MVP 建议默认值：
 - 先保证请求路径短链路，避免引入重依赖与重代理层。
 - 优先减少内存分配与对象复制，控制每请求额外开销。
 - 可观测性以必要指标为主，避免高基数标签导致系统自我放大。
+- 默认全量采样（`metrics_sample_rate=1`）；高压场景可提升采样率（如 `8`、`16`）以降低观测路径开销。
 - 重试与中继必须受预算约束，防止故障时放大流量。
 - 默认配置以保守稳定为主，复杂策略通过配置渐进开启。
 - 配置变更优先热更新路径，减少重启和连接抖动。

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"testing"
+	"time"
 
 	"fluxmesh/internal/model"
 )
@@ -372,6 +373,38 @@ func TestServerStatsCountsRetryAndRelayHit(t *testing.T) {
 	}
 	if stats.SuccessTotal != 1 || stats.ErrorTotal != 0 {
 		t.Fatalf("unexpected success/error counters: success=%d error=%d", stats.SuccessTotal, stats.ErrorTotal)
+	}
+}
+
+func TestServerStatsSamplingRate(t *testing.T) {
+	s := NewServer(nil)
+	s.SetMetricsSampleRate(2)
+
+	s.recordTrafficMetrics(1*time.Millisecond, http.StatusOK, 1, false, 0)
+	stats := s.Stats()
+	if stats.RequestsTotal != 0 {
+		t.Fatalf("expected first sampled-out request to be ignored, got %d", stats.RequestsTotal)
+	}
+
+	s.recordTrafficMetrics(1*time.Millisecond, http.StatusOK, 1, false, 0)
+	stats = s.Stats()
+	if stats.RequestsTotal != 2 {
+		t.Fatalf("expected sampled weight to scale counts to 2, got %d", stats.RequestsTotal)
+	}
+	if stats.SuccessTotal != 2 || stats.ErrorTotal != 0 {
+		t.Fatalf("unexpected success/error totals after sampling: success=%d error=%d", stats.SuccessTotal, stats.ErrorTotal)
+	}
+}
+
+func TestEffectiveMetricsSampleRate(t *testing.T) {
+	if got := effectiveMetricsSampleRate(8, 1); got != 8 {
+		t.Fatalf("expected service sample rate 8, got %d", got)
+	}
+	if got := effectiveMetricsSampleRate(0, 4); got != 4 {
+		t.Fatalf("expected fallback sample rate 4, got %d", got)
+	}
+	if got := effectiveMetricsSampleRate(0, 0); got != 1 {
+		t.Fatalf("expected hard default sample rate 1, got %d", got)
 	}
 }
 

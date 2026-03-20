@@ -43,6 +43,7 @@ type ServiceTrafficPolicy struct {
 	LB        LBPolicy       `json:"lb,omitempty"`
 	Retry     RetryPolicy    `json:"retry,omitempty"`
 	Relay     RelayPolicy    `json:"relay,omitempty"`
+	Observability ObservabilityPolicy `json:"observability,omitempty"`
 }
 
 type ProxyPolicy struct {
@@ -67,6 +68,10 @@ type RelayPolicy struct {
 	MaxHops int `json:"max_hops,omitempty"`
 }
 
+type ObservabilityPolicy struct {
+	MetricsSampleRate int `json:"metrics_sample_rate,omitempty"`
+}
+
 // ApplyDefaults 填充服务配置的最小可运行默认值。
 func (s *ServiceConfig) ApplyDefaults() {
 	if strings.TrimSpace(s.TrafficPolicy.Listener.Addr) == "" {
@@ -79,6 +84,10 @@ func (s *ServiceConfig) ApplyDefaults() {
 
 	if len(s.TrafficPolicy.Protocols) == 0 {
 		s.TrafficPolicy.Protocols = []string{"http"}
+	}
+
+	if s.TrafficPolicy.Observability.MetricsSampleRate <= 0 {
+		s.TrafficPolicy.Observability.MetricsSampleRate = 1
 	}
 
 	for i := range s.Routes {
@@ -123,6 +132,10 @@ func (s ServiceConfig) Validate() error {
 
 	if !isValidLBStrategy(s.TrafficPolicy.LB.Strategy) {
 		return fmt.Errorf("traffic_policy.lb.strategy must use [a-z0-9-], e.g. load-first, round-robin, random")
+	}
+
+	if s.TrafficPolicy.Observability.MetricsSampleRate < 1 || s.TrafficPolicy.Observability.MetricsSampleRate > 10000 {
+		return fmt.Errorf("traffic_policy.observability.metrics_sample_rate must be between 1 and 10000")
 	}
 
 	if len(s.TrafficPolicy.Protocols) == 0 {
