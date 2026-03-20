@@ -1,15 +1,20 @@
 package traffic
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fluxmesh/internal/logx"
@@ -23,7 +28,35 @@ type Server struct {
 	plan      Plan
 	listeners map[string]*http.Server
 	proxies   map[string]*httputil.ReverseProxy
+	metrics   trafficMetrics
 }
+
+type trafficMetrics struct {
+	requestsTotal      atomic.Uint64
+	successTotal       atomic.Uint64
+	errorTotal         atomic.Uint64
+	retryAttemptsTotal atomic.Uint64
+	relayHitTotal      atomic.Uint64
+	totalLatencyNs     atomic.Uint64
+	relayLatencyNs     atomic.Uint64
+}
+
+type TrafficStats struct {
+	RequestsTotal      uint64 `json:"requests_total"`
+	SuccessTotal       uint64 `json:"success_total"`
+	ErrorTotal         uint64 `json:"error_total"`
+	RetryAttemptsTotal uint64 `json:"retry_attempts_total"`
+	RelayHitTotal      uint64 `json:"relay_hit_total"`
+	TotalLatencyNs     uint64 `json:"total_latency_ns"`
+	RelayLatencyNs     uint64 `json:"relay_latency_ns"`
+}
+
+const (
+	headerFluxMeshService     = "X-FluxMesh-Service"
+	headerFluxMeshDestination = "X-FluxMesh-Destination"
+	headerFluxMeshUpstream    = "X-FluxMesh-Upstream"
+	headerFluxMeshHops        = "X-FluxMesh-Hops"
+)
 
 // NewServer 创建流量面运行时实例并初始化监听器与代理缓存。
 func NewServer(services *registry.Services) *Server {
@@ -151,6 +184,14 @@ func (s *Server) refresh(ctx context.Context) error {
 // newListenerHandler 处理入站请求并完成匹配、解析和反向代理转发。
 func (s *Server) newListenerHandler(listener ListenerKey) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startedAt := time.Now()
+		finalStatus := http.StatusInternalServerError
+		attemptsUsed := 0
+		relayHit := false
+		defer func() {
+			s.recordTrafficMetrics(time.Since(startedAt), finalStatus, attemptsUsed, relayHit)
+		}()
+
 		host := r.Host
 		path := r.URL.Path
 		if strings.TrimSpace(path) == "" {
@@ -163,27 +204,196 @@ func (s *Server) newListenerHandler(listener ListenerKey) http.Handler {
 
 		match, ok := plan.Match(listener.Addr, listener.Port, host, path)
 		if !ok {
+			finalStatus = http.StatusNotFound
 			http.Error(w, "no route matched", http.StatusNotFound)
 			return
 		}
 
-		resolved, err := plan.ResolveDestination(match.Destination)
+		policy, _ := plan.ServicePolicy(match.ServiceName)
+		maxAttempts := effectiveMaxAttempts(policy.Retry.MaxAttempts)
+		maxAttempts = applyRetryBudget(maxAttempts, policy.Retry.BudgetRatio)
+
+		incomingHops, err := parseIncomingHops(r.Header.Get(headerFluxMeshHops))
 		if err != nil {
+			finalStatus = http.StatusBadRequest
+			http.Error(w, "invalid relay hops header", http.StatusBadRequest)
+			return
+		}
+
+		maxHops := effectiveMaxHops(policy.Relay.MaxHops)
+		if incomingHops > maxHops {
+			finalStatus = http.StatusLoopDetected
+			http.Error(w, "relay max hops exceeded", http.StatusLoopDetected)
+			return
+		}
+
+		body, err := readRequestBodyBytes(r)
+		if err != nil {
+			finalStatus = http.StatusBadRequest
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+
+		candidates, err := plan.ResolveDestinationsForAttempts(match.Destination, maxAttempts)
+		if err != nil {
+			finalStatus = http.StatusBadGateway
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 
-		proxy, err := s.proxyForDestination(resolved)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
+		for attempt, resolved := range candidates {
+			attemptsUsed = attempt + 1
+			if !relayHit && plan.IsRelayCandidate(match.Destination, resolved) {
+				relayHit = true
+			}
 
-		r.Header.Set("X-FluxMesh-Service", match.ServiceName)
-		r.Header.Set("X-FluxMesh-Destination", match.Destination)
-		r.Header.Set("X-FluxMesh-Upstream", resolved)
-		proxy.ServeHTTP(w, r)
+			proxy, err := s.proxyForDestination(resolved)
+			if err != nil {
+				finalStatus = http.StatusBadGateway
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+
+			attemptReq, err := cloneRequestWithBody(r, body)
+			if err != nil {
+				finalStatus = http.StatusInternalServerError
+				http.Error(w, "failed to clone request", http.StatusInternalServerError)
+				return
+			}
+			attemptReq.Header.Set(headerFluxMeshService, match.ServiceName)
+			attemptReq.Header.Set(headerFluxMeshDestination, match.Destination)
+			attemptReq.Header.Set(headerFluxMeshUpstream, resolved)
+			attemptReq.Header.Set(headerFluxMeshHops, strconv.Itoa(incomingHops+1))
+
+			rr := httptest.NewRecorder()
+			proxy.ServeHTTP(rr, attemptReq)
+
+			if !shouldRetryStatus(rr.Code) || attempt == len(candidates)-1 {
+				finalStatus = rr.Code
+				writeRecordedResponse(w, rr)
+				return
+			}
+		}
 	})
+}
+
+func (s *Server) recordTrafficMetrics(elapsed time.Duration, statusCode int, attemptsUsed int, relayHit bool) {
+	s.metrics.requestsTotal.Add(1)
+	s.metrics.totalLatencyNs.Add(uint64(elapsed.Nanoseconds()))
+
+	if statusCode >= 500 {
+		s.metrics.errorTotal.Add(1)
+	} else {
+		s.metrics.successTotal.Add(1)
+	}
+
+	if attemptsUsed > 1 {
+		s.metrics.retryAttemptsTotal.Add(uint64(attemptsUsed - 1))
+	}
+
+	if relayHit {
+		s.metrics.relayHitTotal.Add(1)
+		s.metrics.relayLatencyNs.Add(uint64(elapsed.Nanoseconds()))
+	}
+}
+
+// Stats 返回流量面轻量统计快照（原子读取，低开销）。
+func (s *Server) Stats() TrafficStats {
+	return TrafficStats{
+		RequestsTotal:      s.metrics.requestsTotal.Load(),
+		SuccessTotal:       s.metrics.successTotal.Load(),
+		ErrorTotal:         s.metrics.errorTotal.Load(),
+		RetryAttemptsTotal: s.metrics.retryAttemptsTotal.Load(),
+		RelayHitTotal:      s.metrics.relayHitTotal.Load(),
+		TotalLatencyNs:     s.metrics.totalLatencyNs.Load(),
+		RelayLatencyNs:     s.metrics.relayLatencyNs.Load(),
+	}
+}
+
+func effectiveMaxAttempts(configured int) int {
+	if configured <= 0 {
+		return 1
+	}
+	return configured
+}
+
+func effectiveMaxHops(configured int) int {
+	if configured <= 0 {
+		return 2
+	}
+	return configured
+}
+
+func applyRetryBudget(maxAttempts int, budgetRatio float64) int {
+	if maxAttempts <= 1 {
+		return 1
+	}
+	if budgetRatio <= 0 {
+		return 1
+	}
+	if budgetRatio >= 1 {
+		return maxAttempts
+	}
+
+	extra := maxAttempts - 1
+	allowedExtra := int(math.Floor(float64(extra) * budgetRatio))
+	if allowedExtra == 0 {
+		allowedExtra = 1
+	}
+	if allowedExtra > extra {
+		allowedExtra = extra
+	}
+	return 1 + allowedExtra
+}
+
+func parseIncomingHops(raw string) (int, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, nil
+	}
+	hops, err := strconv.Atoi(trimmed)
+	if err != nil || hops < 0 {
+		return 0, fmt.Errorf("invalid hops")
+	}
+	return hops, nil
+}
+
+func readRequestBodyBytes(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, nil
+}
+
+func cloneRequestWithBody(r *http.Request, body []byte) (*http.Request, error) {
+	req := r.Clone(r.Context())
+	if body == nil {
+		req.Body = nil
+		req.ContentLength = 0
+		return req, nil
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	return req, nil
+}
+
+func shouldRetryStatus(statusCode int) bool {
+	return statusCode >= http.StatusBadGateway
+}
+
+func writeRecordedResponse(w http.ResponseWriter, rr *httptest.ResponseRecorder) {
+	for k, values := range rr.Header() {
+		for _, v := range values {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(rr.Code)
+	_, _ = w.Write(rr.Body.Bytes())
 }
 
 // proxyForDestination 为解析后的上游地址返回可复用的反向代理实例。

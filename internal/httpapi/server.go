@@ -24,11 +24,12 @@ type Server struct {
 	nodes      *registry.Service
 	services   *registry.Services
 	softStore  *softkv.Store
+	traffic    *traffic.Server
 	version    string
 }
 
-func NewServer(addr string, nodes *registry.Service, services *registry.Services, softStore *softkv.Store, version string) *Server {
-	s := &Server{nodes: nodes, services: services, softStore: softStore, version: version}
+func NewServer(addr string, nodes *registry.Service, services *registry.Services, softStore *softkv.Store, trafficSrv *traffic.Server, version string) *Server {
+	s := &Server{nodes: nodes, services: services, softStore: softStore, traffic: trafficSrv, version: version}
 	mux := http.NewServeMux()
 	// 管理接口
 	mux.HandleFunc("/health", s.handleHealth)
@@ -39,6 +40,7 @@ func NewServer(addr string, nodes *registry.Service, services *registry.Services
 	mux.HandleFunc("/api/v1/services/", s.handleServiceByName)
 	mux.HandleFunc("/api/v1/traffic/plan", s.handleTrafficPlan)
 	mux.HandleFunc("/api/v1/traffic/match", s.handleTrafficMatch)
+	mux.HandleFunc("/api/v1/traffic/stats", s.handleTrafficStats)
 	mux.HandleFunc("/api/v1/softkv", s.handleSoftKV)
 	mux.HandleFunc("/api/v1/softkv/stats", s.handleSoftKVStats)
 	mux.HandleFunc("/api/v1/softkv/", s.handleSoftKVByKey)
@@ -49,6 +51,28 @@ func NewServer(addr string, nodes *registry.Service, services *registry.Services
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	return s
+}
+
+func (s *Server) handleTrafficStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.traffic == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "traffic runtime not initialized"})
+		return
+	}
+
+	stats := s.traffic.Stats()
+	avgLatencyMs := 0.0
+	if stats.RequestsTotal > 0 {
+		avgLatencyMs = float64(stats.TotalLatencyNs) / float64(stats.RequestsTotal) / 1e6
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"stats":          stats,
+		"avg_latency_ms": avgLatencyMs,
+	})
 }
 
 func (s *Server) Start() error {

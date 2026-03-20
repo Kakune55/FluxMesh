@@ -398,3 +398,119 @@ func TestResolveDestinationRegisteredCustomStrategy(t *testing.T) {
 		t.Fatalf("expected custom balancer addr 127.0.0.1:29999, got %s", resolved)
 	}
 }
+
+func TestResolveDestinationsForAttemptsRoundRobinCandidates(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "round-robin"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{
+					Name: "payment-v1",
+					Targets: []model.BackendTarget{
+						{Addr: "127.0.0.1:28081", Weight: 100},
+						{Addr: "127.0.0.1:28082", Weight: 100},
+						{Addr: "127.0.0.1:28083", Weight: 100},
+					},
+				},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	candidates, err := plan.ResolveDestinationsForAttempts("payment-v1", 3)
+	if err != nil {
+		t.Fatalf("resolve candidates failed: %v", err)
+	}
+	if len(candidates) != 3 {
+		t.Fatalf("expected 3 candidates, got %d", len(candidates))
+	}
+	if candidates[0] != "127.0.0.1:28081" || candidates[1] != "127.0.0.1:28082" || candidates[2] != "127.0.0.1:28083" {
+		t.Fatalf("unexpected candidate sequence: %+v", candidates)
+	}
+}
+
+func TestResolveDestinationsForAttemptsLoadFirstFallbackOrder(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "load-first"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{
+					Name: "payment-v1",
+					Targets: []model.BackendTarget{
+						{Addr: "127.0.0.1:28081", Weight: 10},
+						{Addr: "127.0.0.1:28082", Weight: 80},
+						{Addr: "127.0.0.1:28083", Weight: 40},
+					},
+				},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	candidates, err := plan.ResolveDestinationsForAttempts("payment-v1", 3)
+	if err != nil {
+		t.Fatalf("resolve candidates failed: %v", err)
+	}
+
+	if candidates[0] != "127.0.0.1:28082" || candidates[1] != "127.0.0.1:28083" || candidates[2] != "127.0.0.1:28081" {
+		t.Fatalf("unexpected load-first fallback order: %+v", candidates)
+	}
+}
+
+func TestResolveDestinationsForAttemptsPrefersDirectBeforeRelay(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "relay-priority-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "load-first"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{
+					Name: "relay-priority-group",
+					Targets: []model.BackendTarget{
+						{Addr: "127.0.0.1:28100", Weight: 20},
+						{Addr: "127.0.0.1:28101", Weight: 90, Tags: map[string]string{"relay": "true"}},
+						{Addr: "127.0.0.1:28102", Weight: 10, Tags: map[string]string{"relay": "true"}},
+					},
+				},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "relay-priority-group", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	candidates, err := plan.ResolveDestinationsForAttempts("relay-priority-group", 3)
+	if err != nil {
+		t.Fatalf("resolve candidates failed: %v", err)
+	}
+	if len(candidates) != 3 {
+		t.Fatalf("expected 3 candidates, got %d", len(candidates))
+	}
+
+	if candidates[0] != "127.0.0.1:28100" || candidates[1] != "127.0.0.1:28101" || candidates[2] != "127.0.0.1:28102" {
+		t.Fatalf("expected direct-first relay-fallback order, got %+v", candidates)
+	}
+}

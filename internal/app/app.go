@@ -157,7 +157,7 @@ func (a *App) Run(parent context.Context) error {
 		return err
 	}
 
-	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.services, a.softStore, a.cfg.Version)
+	a.http = httpapi.NewServer(a.cfg.AdminAddr, a.nodes, a.services, a.softStore, a.traffic, a.cfg.Version)
 	return a.http.Start()
 }
 

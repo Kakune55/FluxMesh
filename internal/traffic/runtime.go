@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"fmt"
+	"math/rand"
 	"net"
 	"net/url"
 	"sort"
@@ -32,8 +33,10 @@ type ListenerPlan struct {
 type Plan struct {
 	listeners        map[string]ListenerPlan
 	backendGroups    map[string]model.BackendGroup
+	backendRelayAddrs map[string]map[string]struct{}
 	backendStrategy  map[string]string
 	serviceListeners map[string]ListenerKey
+	servicePolicies  map[string]model.ServiceTrafficPolicy
 	state            *planState
 }
 
@@ -48,8 +51,10 @@ type MatchResult struct {
 func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	listeners := make(map[string]ListenerPlan)
 	backendGroups := make(map[string]model.BackendGroup)
+	backendRelayAddrs := make(map[string]map[string]struct{})
 	backendStrategy := make(map[string]string)
 	serviceListeners := make(map[string]ListenerKey)
+	servicePolicies := make(map[string]model.ServiceTrafficPolicy)
 
 	for i := range services {
 		cfg := services[i]
@@ -59,12 +64,20 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 		}
 
 		serviceListeners[cfg.Name] = ListenerKey{Addr: cfg.TrafficPolicy.Listener.Addr, Port: cfg.TrafficPolicy.Listener.Port}
+		servicePolicies[cfg.Name] = cfg.TrafficPolicy
 		for _, group := range cfg.BackendGroups {
 			name := strings.TrimSpace(group.Name)
 			if _, exists := backendGroups[name]; exists {
 				return Plan{}, fmt.Errorf("duplicated backend group name: %s", name)
 			}
 			backendGroups[name] = group
+			relaySet := make(map[string]struct{})
+			for _, target := range group.Targets {
+				if isRelayTarget(target) {
+					relaySet[target.Addr] = struct{}{}
+				}
+			}
+			backendRelayAddrs[name] = relaySet
 			backendStrategy[name] = normalizeLBStrategy(cfg.TrafficPolicy.LB.Strategy)
 		}
 
@@ -105,8 +118,10 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	return Plan{
 		listeners:        listeners,
 		backendGroups:    backendGroups,
+		backendRelayAddrs: backendRelayAddrs,
 		backendStrategy:  backendStrategy,
 		serviceListeners: serviceListeners,
+		servicePolicies:  servicePolicies,
 		state:            newPlanState(),
 	}, nil
 }
@@ -193,6 +208,164 @@ func (p Plan) ResolveDestination(destination string) (string, error) {
 	}
 
 	return "", fmt.Errorf("destination %q cannot be resolved (expect backend_group, service name, or host:port)", destination)
+}
+
+// ResolveDestinationsForAttempts 返回给定尝试次数下的候选上游地址列表。
+func (p Plan) ResolveDestinationsForAttempts(destination string, attempts int) ([]string, error) {
+	if attempts <= 0 {
+		return nil, fmt.Errorf("attempts must be greater than 0")
+	}
+
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return nil, fmt.Errorf("route destination is empty")
+	}
+
+	if group, ok := p.backendGroups[destination]; ok {
+		strategy := p.backendStrategy[destination]
+		return p.backendCandidatesForAttempts(destination, group, strategy, attempts)
+	}
+
+	resolved, err := p.ResolveDestination(destination)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]string, 0, attempts)
+	for i := 0; i < attempts; i++ {
+		items = append(items, resolved)
+	}
+	return items, nil
+}
+
+func (p Plan) backendCandidatesForAttempts(groupName string, group model.BackendGroup, strategy string, attempts int) ([]string, error) {
+	if len(group.Targets) == 0 {
+		return nil, fmt.Errorf("backend group %q has no targets", group.Name)
+	}
+
+	ordered := orderedBackendTargets(groupName, group, strategy, p.state)
+	if len(ordered) == 0 {
+		return nil, fmt.Errorf("backend group %q has no ordered targets", group.Name)
+	}
+
+	items := make([]string, 0, attempts)
+	for i := 0; i < attempts; i++ {
+		items = append(items, ordered[i%len(ordered)])
+	}
+	return items, nil
+}
+
+func orderedBackendTargets(groupName string, group model.BackendGroup, strategy string, state *planState) []string {
+	directTargets, relayTargets := splitDirectAndRelayTargets(group.Targets)
+
+	directOrdered := orderTargetsByStrategy(groupName+"#direct", directTargets, strategy, state)
+	relayOrdered := orderTargetsByStrategy(groupName+"#relay", relayTargets, strategy, state)
+
+	ordered := make([]model.BackendTarget, 0, len(directOrdered)+len(relayOrdered))
+	ordered = append(ordered, directOrdered...)
+	ordered = append(ordered, relayOrdered...)
+
+	result := make([]string, 0, len(ordered))
+	for _, target := range ordered {
+		result = append(result, target.Addr)
+	}
+	return result
+}
+
+func orderTargetsByStrategy(groupName string, targets []model.BackendTarget, strategy string, state *planState) []model.BackendTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+
+	resolved := normalizeLBStrategy(strategy)
+	ordered := make([]model.BackendTarget, len(targets))
+	copy(ordered, targets)
+
+	switch resolved {
+	case "round-robin":
+		start := nextRoundRobinIndex(groupName, len(ordered), state)
+		rotated := make([]model.BackendTarget, 0, len(ordered))
+		for i := 0; i < len(ordered); i++ {
+			idx := (start + i) % len(ordered)
+			rotated = append(rotated, ordered[idx])
+		}
+		return rotated
+	case "random":
+		shuffleBackendTargets(ordered, state)
+	default:
+		sort.SliceStable(ordered, func(i, j int) bool {
+			if ordered[i].Weight != ordered[j].Weight {
+				return ordered[i].Weight > ordered[j].Weight
+			}
+			return ordered[i].Addr < ordered[j].Addr
+		})
+	}
+	return ordered
+}
+
+
+func splitDirectAndRelayTargets(targets []model.BackendTarget) ([]model.BackendTarget, []model.BackendTarget) {
+	direct := make([]model.BackendTarget, 0, len(targets))
+	relay := make([]model.BackendTarget, 0, len(targets))
+	for _, target := range targets {
+		if isRelayTarget(target) {
+			relay = append(relay, target)
+			continue
+		}
+		direct = append(direct, target)
+	}
+	return direct, relay
+}
+
+func isRelayTarget(target model.BackendTarget) bool {
+	if len(target.Tags) == 0 {
+		return false
+	}
+	for key, value := range target.Tags {
+		if strings.EqualFold(strings.TrimSpace(key), "relay") {
+			v := strings.ToLower(strings.TrimSpace(value))
+			return v == "1" || v == "true" || v == "yes" || v == "on"
+		}
+	}
+	return false
+}
+
+func shuffleBackendTargets(targets []model.BackendTarget, state *planState) {
+	if len(targets) <= 1 {
+		return
+	}
+
+	if state == nil {
+		rand.Shuffle(len(targets), func(i, j int) {
+			targets[i], targets[j] = targets[j], targets[i]
+		})
+		return
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.rng.Shuffle(len(targets), func(i, j int) {
+		targets[i], targets[j] = targets[j], targets[i]
+	})
+}
+
+// ServicePolicy 返回指定服务的流量策略。
+func (p Plan) ServicePolicy(serviceName string) (model.ServiceTrafficPolicy, bool) {
+	policy, ok := p.servicePolicies[strings.TrimSpace(serviceName)]
+	if !ok {
+		return model.ServiceTrafficPolicy{}, false
+	}
+	return policy, true
+}
+
+// IsRelayCandidate 判断解析出的目标是否属于 relay 候选。
+func (p Plan) IsRelayCandidate(destination string, resolved string) bool {
+	relaySet, ok := p.backendRelayAddrs[strings.TrimSpace(destination)]
+	if !ok || len(relaySet) == 0 {
+		return false
+	}
+	_, hit := relaySet[strings.TrimSpace(resolved)]
+	return hit
 }
 
 // listenerMapKey 生成监听器在规划表中的唯一键。

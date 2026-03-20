@@ -15,6 +15,7 @@ import (
 	"fluxmesh/internal/registry"
 	"fluxmesh/internal/softkv"
 	"fluxmesh/internal/testutil/etcdtest"
+	"fluxmesh/internal/traffic"
 )
 
 func mustAllocateTCPAddr(t *testing.T) string {
@@ -488,8 +489,52 @@ func TestHandleTrafficPlanAndMatch(t *testing.T) {
 	})
 }
 
+func TestHandleTrafficStats(t *testing.T) {
+	t.Run("method not allowed", func(t *testing.T) {
+		s := &Server{}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/traffic/stats", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficStats(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected %d, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+
+	t.Run("traffic runtime missing", func(t *testing.T) {
+		s := &Server{}
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/stats", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficStats(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected %d, got %d", http.StatusInternalServerError, w.Code)
+		}
+	})
+
+	t.Run("ok", func(t *testing.T) {
+		svc := traffic.NewServer(nil)
+		s := &Server{traffic: svc}
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/stats", nil)
+		w := httptest.NewRecorder()
+		s.handleTrafficStats(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected %d, got %d body=%s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if _, ok := payload["stats"].(map[string]any); !ok {
+			t.Fatalf("expected stats object in payload")
+		}
+		if _, ok := payload["avg_latency_ms"].(float64); !ok {
+			t.Fatalf("expected avg_latency_ms field in payload")
+		}
+	})
+}
+
 func TestNewServerAndHandleHealth(t *testing.T) {
-	s := NewServer("127.0.0.1:0", nil, nil, nil, "v-test")
+	s := NewServer("127.0.0.1:0", nil, nil, nil, nil, "v-test")
 	if s == nil || s.httpServer == nil || s.httpServer.Handler == nil {
 		t.Fatalf("expected initialized http server")
 	}
@@ -512,7 +557,7 @@ func TestNewServerAndHandleHealth(t *testing.T) {
 
 func TestServerStartAndShutdown(t *testing.T) {
 	addr := mustAllocateTCPAddr(t)
-	s := NewServer(addr, nil, nil, nil, "v-test")
+	s := NewServer(addr, nil, nil, nil, nil, "v-test")
 
 	if err := s.Start(); err != nil {
 		t.Fatalf("start failed: %v", err)
