@@ -25,6 +25,19 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+type metricsCollector interface {
+	Collect() (sysmetrics.Snapshot, error)
+}
+
+type softStateWriter interface {
+	Write(ctx context.Context, key string, value any, ttl time.Duration, sourceID string) (softkv.WriteResult, error)
+}
+
+var (
+	runMemberlistFn = softkv.RunMemberlist
+	runLoopbackFn   = softkv.RunLoopback
+)
+
 type App struct {
 	cfg          config.Config
 	embedded     *etcd.EmbeddedServer
@@ -33,16 +46,18 @@ type App struct {
 	services     *registry.Services
 	softStore    *softkv.Store
 	softBus      *softkv.Bus
-	softWriter   *softkv.Writer
+	softWriter   softStateWriter
 	http         *httpapi.Server
 	traffic      *traffic.Server
 	reconciler   *reconcile.MemberReconciler
-	metrics      *sysmetrics.Collector
+	metrics      metricsCollector
 	selfNode     model.Node
 	nodeMu       sync.RWMutex
 	leaseID      clientv3.LeaseID
 	keepAliveCh  <-chan *clientv3.LeaseKeepAliveResponse
 	leaseMu      sync.RWMutex
+	leaseRegFn   func(context.Context) error
+	backoffWait  func(context.Context, time.Duration) error
 	appCtx       context.Context
 	cancel       context.CancelFunc
 	backgroundWG sync.WaitGroup
@@ -278,13 +293,22 @@ func (a *App) registerNodeLease(ctx context.Context) error {
 
 func (a *App) recoverLease(ctx context.Context) error {
 	backoff := time.Second
+	register := a.leaseRegFn
+	if register == nil {
+		register = a.registerNodeLease
+	}
+	waitBackoff := a.backoffWait
+	if waitBackoff == nil {
+		waitBackoff = waitBackoffWithContext
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := a.registerNodeLease(attemptCtx)
+		err := register(attemptCtx)
 		cancel()
 		if err == nil {
 			logx.Info("租约已重建，节点重新注册成功", "node_id", a.selfNode.ID)
@@ -292,17 +316,25 @@ func (a *App) recoverLease(ctx context.Context) error {
 		}
 
 		logx.Warn("租约重建失败，准备重试", "err", err, "next_in", backoff.String())
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := waitBackoff(ctx, backoff); err != nil {
+			return err
 		}
 
 		if backoff < 8*time.Second {
 			backoff *= 2
 		}
+	}
+}
+
+func waitBackoffWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -397,7 +429,7 @@ func (a *App) runSoftKVBus(ctx context.Context) {
 	}
 
 	peers := a.discoverGossipPeers(ctx)
-	err := softkv.RunMemberlist(ctx, a.softStore, a.softBus.Subscribe(), softkv.MemberlistOptions{
+	err := runMemberlistFn(ctx, a.softStore, a.softBus.Subscribe(), softkv.MemberlistOptions{
 		NodeID:        a.cfg.NodeID,
 		AdvertiseAddr: a.cfg.IP,
 		BindPort:      softkv.DefaultGossipPort,
@@ -405,7 +437,7 @@ func (a *App) runSoftKVBus(ctx context.Context) {
 	})
 	if err != nil {
 		logx.Warn("softkv gossip 启动失败，回退 loopback", "err", err)
-		softkv.RunLoopback(ctx, a.softStore, a.softBus.Subscribe())
+		runLoopbackFn(ctx, a.softStore, a.softBus.Subscribe())
 	}
 }
 
