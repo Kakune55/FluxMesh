@@ -166,7 +166,7 @@ FluxMesh 的设计取舍是：
 
 ## 10. 运维与联调建议
 
-- 日常联调优先使用 quickstart-mvp.md 的 API 清单。
+- 日常联调优先使用 [快速开始](../getting-started.md) 的 API 清单。
 - 处理 409 冲突时，优先采用返回的 current_resource_version/current_config 重试。
 - 生产化前必须补齐认证和操作审计持久化。
 
