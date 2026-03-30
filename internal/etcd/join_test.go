@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"context"
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -42,5 +43,28 @@ func TestContainsURL(t *testing.T) {
 	}
 	if containsURL(urls, "http://c:3") {
 		t.Fatalf("expected url not to be found")
+	}
+}
+
+func TestJoinExistingClusterCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := JoinExistingCluster(ctx, []string{"http://127.0.0.1:2379"}, "node-x", "http://127.0.0.1:2380")
+	if err == nil {
+		t.Fatalf("expected error from canceled context")
+	}
+	if res.InitialCluster != "" || res.MemberID != 0 || len(res.SeedEndpoints) != 0 {
+		t.Fatalf("expected zero JoinResult on failure, got %+v", res)
+	}
+}
+
+func TestRollbackMemberCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := RollbackMember(ctx, []string{"http://127.0.0.1:2379"}, 123)
+	if err == nil {
+		t.Fatalf("expected error from canceled context")
 	}
 }
