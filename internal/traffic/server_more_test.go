@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"fluxmesh/internal/model"
-
 )
 
 type closeErrListener struct{}

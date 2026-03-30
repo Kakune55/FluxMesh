@@ -70,3 +70,17 @@ func TestDetectLANIPv4FromInterfacesNoMatch(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestDetectLANIPv4Wrapper(t *testing.T) {
+	ip, err := DetectLANIPv4()
+	if err != nil {
+		if err.Error() == "" {
+			t.Fatalf("expected non-empty error when detection fails")
+		}
+		return
+	}
+
+	if net.ParseIP(ip) == nil {
+		t.Fatalf("expected a valid ip string, got %q", ip)
+	}
+}
