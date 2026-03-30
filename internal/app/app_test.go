@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -601,4 +602,106 @@ func TestGCSoftState(t *testing.T) {
 			t.Fatalf("expected quick return when context is canceled")
 		}
 	})
+}
+
+func mustAllocHTTPURL(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate tcp port failed: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	u, err := url.Parse("http://" + addr)
+	if err != nil {
+		t.Fatalf("parse allocated url failed: %v", err)
+	}
+	return u.String()
+}
+
+func TestStartEtcdAndClientAgent(t *testing.T) {
+	t.Run("empty seed endpoints", func(t *testing.T) {
+		a := &App{cfg: config.Config{Role: config.RoleAgent}}
+		if err := a.startEtcdAndClient(context.Background()); err == nil {
+			t.Fatalf("expected error when agent seed endpoints are empty")
+		}
+	})
+
+	t.Run("connect existing control plane", func(t *testing.T) {
+		emb := etcdtest.Start(t)
+		a := &App{cfg: config.Config{Role: config.RoleAgent, SeedEndpoints: []string{emb.Client.Endpoints()[0]}}}
+		if err := a.startEtcdAndClient(context.Background()); err != nil {
+			t.Fatalf("expected agent client start success, got %v", err)
+		}
+		if a.client == nil {
+			t.Fatalf("expected non-nil etcd client")
+		}
+		t.Cleanup(func() {
+			_ = a.client.Close()
+		})
+	})
+}
+
+func TestStartEtcdAndClientServerNew(t *testing.T) {
+	clientURL := mustAllocHTTPURL(t)
+	peerURL := mustAllocHTTPURL(t)
+
+	a := &App{cfg: config.Config{
+		Role:               config.RoleServer,
+		ClusterState:       config.ClusterStateNew,
+		NodeID:             "server-new",
+		DataDir:            t.TempDir(),
+		ClientListenURL:    clientURL,
+		ClientAdvertiseURL: clientURL,
+		PeerListenURL:      peerURL,
+		PeerAdvertiseURL:   peerURL,
+	}}
+
+	if err := a.startEtcdAndClient(context.Background()); err != nil {
+		t.Fatalf("expected server new start success, got %v", err)
+	}
+	if a.embedded == nil || a.client == nil {
+		t.Fatalf("expected embedded etcd and client to be initialized")
+	}
+
+	t.Cleanup(func() {
+		_ = a.client.Close()
+		a.embedded.Close()
+	})
+}
+
+func TestRunAndShutdownAgentLifecycle(t *testing.T) {
+	emb := etcdtest.Start(t)
+
+	a, err := New(config.Config{
+		Role:            config.RoleAgent,
+		NodeID:          "agent-lifecycle",
+		IP:              "127.0.0.1",
+		Version:         "v-test",
+		AdminAddr:       "127.0.0.1:0",
+		SeedEndpoints:   []string{emb.Client.Endpoints()[0]},
+		LeaseTTLSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("new app failed: %v", err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	if err := a.Run(runCtx); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if a.client == nil || a.nodes == nil || a.services == nil || a.traffic == nil || a.http == nil {
+		t.Fatalf("expected core runtime dependencies initialized")
+	}
+	if a.selfNode.ID != "agent-lifecycle" {
+		t.Fatalf("expected self node to be initialized")
+	}
+
+	cancelRun()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelShutdown()
+	if err := a.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
 }
