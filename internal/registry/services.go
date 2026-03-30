@@ -18,11 +18,20 @@ var ErrServiceNotFound = errors.New("service not found")
 var ErrServiceConflict = errors.New("service resource version conflict")
 
 type Services struct {
-	kv clientv3.KV
+	kv      clientv3.KV
+	watcher clientv3.Watcher
 }
 
 func NewServices(cli *clientv3.Client) *Services {
-	return &Services{kv: cli}
+	return &Services{kv: cli, watcher: cli}
+}
+
+func (s *Services) Watch(ctx context.Context, startRevision int64) clientv3.WatchChan {
+	options := []clientv3.OpOption{clientv3.WithPrefix()}
+	if startRevision > 0 {
+		options = append(options, clientv3.WithRev(startRevision))
+	}
+	return s.watcher.Watch(ctx, servicesPrefix, options...)
 }
 
 func (s *Services) Put(ctx context.Context, cfg model.ServiceConfig) error {

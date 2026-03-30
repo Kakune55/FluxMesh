@@ -39,6 +39,81 @@ func TestParseDestination(t *testing.T) {
 	}
 }
 
+func TestServiceSnapshotKeyStableAcrossOrder(t *testing.T) {
+	a := []model.ServiceConfig{
+		{Name: "svc-a", ResourceVersion: 11},
+		{Name: "svc-b", ResourceVersion: 22},
+	}
+	b := []model.ServiceConfig{
+		{Name: "svc-b", ResourceVersion: 22},
+		{Name: "svc-a", ResourceVersion: 11},
+	}
+
+	ka := serviceSnapshotKey(a)
+	kb := serviceSnapshotKey(b)
+	if ka != kb {
+		t.Fatalf("expected stable snapshot key across order, got %q vs %q", ka, kb)
+	}
+}
+
+func TestServiceSnapshotKeyChangesOnRevision(t *testing.T) {
+	a := []model.ServiceConfig{{Name: "svc-a", ResourceVersion: 11}}
+	b := []model.ServiceConfig{{Name: "svc-a", ResourceVersion: 12}}
+
+	ka := serviceSnapshotKey(a)
+	kb := serviceSnapshotKey(b)
+	if ka == kb {
+		t.Fatalf("expected snapshot key to change when revision changes")
+	}
+}
+
+func TestNextServiceWatchRevision(t *testing.T) {
+	if got := nextServiceWatchRevision(nil); got != 1 {
+		t.Fatalf("expected empty watch revision 1, got %d", got)
+	}
+
+	items := []model.ServiceConfig{
+		{Name: "svc-a", ResourceVersion: 11},
+		{Name: "svc-b", ResourceVersion: 22},
+		{Name: "svc-c", ResourceVersion: 18},
+	}
+	if got := nextServiceWatchRevision(items); got != 23 {
+		t.Fatalf("expected watch revision 23, got %d", got)
+	}
+}
+
+func TestUDPDialAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "host port", input: "127.0.0.1:5353", want: "127.0.0.1:5353"},
+		{name: "udp url", input: "udp://127.0.0.1:5353", want: "127.0.0.1:5353"},
+		{name: "invalid scheme", input: "http://127.0.0.1:5353", wantErr: true},
+		{name: "missing port", input: "127.0.0.1", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := udpDialAddress(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("expected %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestNewReverseProxy(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -179,6 +254,103 @@ func TestHandleTCPConnProxy(t *testing.T) {
 
 	if string(out[:n]) != "echo:ping" {
 		t.Fatalf("unexpected tcp proxy response: %s", string(out[:n]))
+	}
+}
+
+func TestHandleUDPPacketProxy(t *testing.T) {
+	upstreamAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("resolve udp addr failed: %v", err)
+	}
+	upstream, err := net.ListenUDP("udp", upstreamAddr)
+	if err != nil {
+		t.Fatalf("failed to start udp upstream: %v", err)
+	}
+	defer upstream.Close()
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := upstream.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = upstream.WriteToUDP([]byte("echo:"+string(buf[:n])), addr)
+		}
+	}()
+
+	downstreamAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("resolve downstream udp addr failed: %v", err)
+	}
+	downstream, err := net.ListenUDP("udp", downstreamAddr)
+	if err != nil {
+		t.Fatalf("failed to start udp downstream: %v", err)
+	}
+	defer downstream.Close()
+
+	listener := ListenerKey{Addr: "127.0.0.1", Port: downstream.LocalAddr().(*net.UDPAddr).Port}
+	plan, err := BuildPlan([]model.ServiceConfig{{
+		Name: "udp-gateway",
+		TrafficPolicy: model.ServiceTrafficPolicy{
+			Proxy:    model.ProxyPolicy{Layer: "l4-udp"},
+			Listener: model.ListenerPolicy{Addr: listener.Addr, Port: listener.Port},
+		},
+		Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: upstream.LocalAddr().String(), Weight: 100}},
+	}})
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	s := &Server{plan: plan, listeners: map[string]*http.Server{}, proxies: map[string]*httputil.ReverseProxy{}, udpListeners: map[string]*net.UDPConn{}}
+	options := udpRuntimeOptions{
+		MaxPacketSize: 64 * 1024,
+		DialTimeout:   2 * time.Second,
+		ReadTimeout:   2 * time.Second,
+		WriteTimeout:  2 * time.Second,
+		SessionTTL:    30 * time.Second,
+	}
+	go s.acceptUDPLoop(listener, downstream, options)
+
+	clientConn, err := net.DialUDP("udp", nil, downstream.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("dial downstream failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	if err := clientConn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set client deadline failed: %v", err)
+	}
+
+	if _, err := clientConn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write to udp proxy failed: %v", err)
+	}
+
+	out := make([]byte, 64)
+	n, err := clientConn.Read(out)
+	if err != nil {
+		t.Fatalf("read from udp proxy failed: %v", err)
+	}
+	if string(out[:n]) != "echo:ping" {
+		t.Fatalf("unexpected udp proxy response: %s", string(out[:n]))
+	}
+
+	if _, err := clientConn.Write([]byte("pong")); err != nil {
+		t.Fatalf("write second packet to udp proxy failed: %v", err)
+	}
+	n, err = clientConn.Read(out)
+	if err != nil {
+		t.Fatalf("read second packet from udp proxy failed: %v", err)
+	}
+	if string(out[:n]) != "echo:pong" {
+		t.Fatalf("unexpected second udp proxy response: %s", string(out[:n]))
+	}
+
+	s.udpSessionMu.Lock()
+	sessionCount := len(s.udpSessions)
+	s.udpSessionMu.Unlock()
+	if sessionCount != 1 {
+		t.Fatalf("expected one reused udp session, got %d", sessionCount)
 	}
 }
 

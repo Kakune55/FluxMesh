@@ -40,6 +40,7 @@ type ServiceTrafficPolicy struct {
 	Proxy     ProxyPolicy    `json:"proxy,omitempty"`
 	Protocols []string       `json:"protocols,omitempty"`
 	Listener  ListenerPolicy `json:"listener"`
+	UDP       UDPPolicy      `json:"udp,omitempty"`
 	LB        LBPolicy       `json:"lb,omitempty"`
 	Retry     RetryPolicy    `json:"retry,omitempty"`
 	Relay     RelayPolicy    `json:"relay,omitempty"`
@@ -53,6 +54,14 @@ type ProxyPolicy struct {
 type ListenerPolicy struct {
 	Addr string `json:"addr,omitempty"`
 	Port int    `json:"port"`
+}
+
+type UDPPolicy struct {
+	DialTimeoutMs  int `json:"dial_timeout_ms,omitempty"`
+	ReadTimeoutMs  int `json:"read_timeout_ms,omitempty"`
+	WriteTimeoutMs int `json:"write_timeout_ms,omitempty"`
+	SessionTTLMs   int `json:"session_ttl_ms,omitempty"`
+	MaxPacketSize  int `json:"max_packet_size,omitempty"`
 }
 
 type LBPolicy struct {
@@ -83,15 +92,35 @@ func (s *ServiceConfig) ApplyDefaults() {
 	}
 
 	if len(s.TrafficPolicy.Protocols) == 0 {
-		if strings.EqualFold(strings.TrimSpace(s.TrafficPolicy.Proxy.Layer), "l4-tcp") {
+		layer := strings.ToLower(strings.TrimSpace(s.TrafficPolicy.Proxy.Layer))
+		switch layer {
+		case "l4-tcp":
 			s.TrafficPolicy.Protocols = []string{"tcp"}
-		} else {
+		case "l4-udp":
+			s.TrafficPolicy.Protocols = []string{"udp"}
+		default:
 			s.TrafficPolicy.Protocols = []string{"http"}
 		}
 	}
 
 	if s.TrafficPolicy.Observability.MetricsSampleRate <= 0 {
 		s.TrafficPolicy.Observability.MetricsSampleRate = 1
+	}
+
+	if s.TrafficPolicy.UDP.DialTimeoutMs <= 0 {
+		s.TrafficPolicy.UDP.DialTimeoutMs = 2000
+	}
+	if s.TrafficPolicy.UDP.ReadTimeoutMs <= 0 {
+		s.TrafficPolicy.UDP.ReadTimeoutMs = 2000
+	}
+	if s.TrafficPolicy.UDP.WriteTimeoutMs <= 0 {
+		s.TrafficPolicy.UDP.WriteTimeoutMs = 2000
+	}
+	if s.TrafficPolicy.UDP.SessionTTLMs <= 0 {
+		s.TrafficPolicy.UDP.SessionTTLMs = 30000
+	}
+	if s.TrafficPolicy.UDP.MaxPacketSize <= 0 {
+		s.TrafficPolicy.UDP.MaxPacketSize = 65535
 	}
 
 	for i := range s.Routes {
@@ -130,8 +159,8 @@ func (s ServiceConfig) Validate() error {
 	}
 
 	layer := strings.TrimSpace(s.TrafficPolicy.Proxy.Layer)
-	if layer != "l7-http" && layer != "l4-tcp" {
-		return fmt.Errorf("traffic_policy.proxy.layer must be l7-http or l4-tcp")
+	if layer != "l7-http" && layer != "l4-tcp" && layer != "l4-udp" {
+		return fmt.Errorf("traffic_policy.proxy.layer must be l7-http, l4-tcp, or l4-udp")
 	}
 
 	if !isValidLBStrategy(s.TrafficPolicy.LB.Strategy) {
@@ -140,6 +169,22 @@ func (s ServiceConfig) Validate() error {
 
 	if s.TrafficPolicy.Observability.MetricsSampleRate < 1 || s.TrafficPolicy.Observability.MetricsSampleRate > 10000 {
 		return fmt.Errorf("traffic_policy.observability.metrics_sample_rate must be between 1 and 10000")
+	}
+
+	if s.TrafficPolicy.UDP.DialTimeoutMs < 1 || s.TrafficPolicy.UDP.DialTimeoutMs > 60000 {
+		return fmt.Errorf("traffic_policy.udp.dial_timeout_ms must be between 1 and 60000")
+	}
+	if s.TrafficPolicy.UDP.ReadTimeoutMs < 1 || s.TrafficPolicy.UDP.ReadTimeoutMs > 60000 {
+		return fmt.Errorf("traffic_policy.udp.read_timeout_ms must be between 1 and 60000")
+	}
+	if s.TrafficPolicy.UDP.WriteTimeoutMs < 1 || s.TrafficPolicy.UDP.WriteTimeoutMs > 60000 {
+		return fmt.Errorf("traffic_policy.udp.write_timeout_ms must be between 1 and 60000")
+	}
+	if s.TrafficPolicy.UDP.SessionTTLMs < 100 || s.TrafficPolicy.UDP.SessionTTLMs > 3600000 {
+		return fmt.Errorf("traffic_policy.udp.session_ttl_ms must be between 100 and 3600000")
+	}
+	if s.TrafficPolicy.UDP.MaxPacketSize < 512 || s.TrafficPolicy.UDP.MaxPacketSize > 65535 {
+		return fmt.Errorf("traffic_policy.udp.max_packet_size must be between 512 and 65535")
 	}
 
 	if len(s.TrafficPolicy.Protocols) == 0 {
@@ -156,8 +201,12 @@ func (s ServiceConfig) Validate() error {
 			if p != "tcp" {
 				return fmt.Errorf("traffic_policy.protocols[%d] only supports tcp when proxy.layer=l4-tcp", i)
 			}
+		case "l4-udp":
+			if p != "udp" {
+				return fmt.Errorf("traffic_policy.protocols[%d] only supports udp when proxy.layer=l4-udp", i)
+			}
 		default:
-			return fmt.Errorf("traffic_policy.proxy.layer must be l7-http or l4-tcp")
+			return fmt.Errorf("traffic_policy.proxy.layer must be l7-http, l4-tcp, or l4-udp")
 		}
 	}
 

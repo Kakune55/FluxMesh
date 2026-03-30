@@ -266,3 +266,83 @@ func TestServiceConfigValidateL4ProtocolMismatch(t *testing.T) {
 		t.Fatalf("expected validation error for l4-tcp protocol mismatch")
 	}
 }
+
+func TestServiceConfigApplyDefaultsL4UDP(t *testing.T) {
+	cfg := ServiceConfig{
+		Name: "udp-gateway",
+		TrafficPolicy: ServiceTrafficPolicy{
+			Proxy:    ProxyPolicy{Layer: "l4-udp"},
+			Listener: ListenerPolicy{Port: 19091},
+		},
+		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:5353"}},
+	}
+
+	cfg.ApplyDefaults()
+
+	if len(cfg.TrafficPolicy.Protocols) != 1 || cfg.TrafficPolicy.Protocols[0] != "udp" {
+		t.Fatalf("expected protocol default [udp] for l4-udp, got %+v", cfg.TrafficPolicy.Protocols)
+	}
+}
+
+func TestServiceConfigValidateL4UDPProtocolMismatch(t *testing.T) {
+	cfg := ServiceConfig{
+		Name: "udp-gateway",
+		TrafficPolicy: ServiceTrafficPolicy{
+			Proxy:     ProxyPolicy{Layer: "l4-udp"},
+			Protocols: []string{"tcp"},
+			Listener:  ListenerPolicy{Port: 19091},
+		},
+		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:5353", Weight: 100}},
+	}
+
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for l4-udp protocol mismatch")
+	}
+}
+
+func TestServiceConfigApplyDefaultsUDPPolicy(t *testing.T) {
+	cfg := ServiceConfig{
+		Name: "udp-gateway",
+		TrafficPolicy: ServiceTrafficPolicy{
+			Proxy:    ProxyPolicy{Layer: "l4-udp"},
+			Listener: ListenerPolicy{Port: 19091},
+		},
+		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:5353"}},
+	}
+
+	cfg.ApplyDefaults()
+
+	if cfg.TrafficPolicy.UDP.DialTimeoutMs != 2000 {
+		t.Fatalf("expected default udp dial timeout 2000ms, got %d", cfg.TrafficPolicy.UDP.DialTimeoutMs)
+	}
+	if cfg.TrafficPolicy.UDP.ReadTimeoutMs != 2000 {
+		t.Fatalf("expected default udp read timeout 2000ms, got %d", cfg.TrafficPolicy.UDP.ReadTimeoutMs)
+	}
+	if cfg.TrafficPolicy.UDP.WriteTimeoutMs != 2000 {
+		t.Fatalf("expected default udp write timeout 2000ms, got %d", cfg.TrafficPolicy.UDP.WriteTimeoutMs)
+	}
+	if cfg.TrafficPolicy.UDP.SessionTTLMs != 30000 {
+		t.Fatalf("expected default udp session ttl 30000ms, got %d", cfg.TrafficPolicy.UDP.SessionTTLMs)
+	}
+	if cfg.TrafficPolicy.UDP.MaxPacketSize != 65535 {
+		t.Fatalf("expected default udp max packet 65535, got %d", cfg.TrafficPolicy.UDP.MaxPacketSize)
+	}
+}
+
+func TestServiceConfigValidateUDPPolicyRange(t *testing.T) {
+	cfg := ServiceConfig{
+		Name: "udp-gateway",
+		TrafficPolicy: ServiceTrafficPolicy{
+			Proxy:    ProxyPolicy{Layer: "l4-udp"},
+			Listener: ListenerPolicy{Port: 19091},
+			UDP:      UDPPolicy{DialTimeoutMs: 0, ReadTimeoutMs: 10, WriteTimeoutMs: 10, SessionTTLMs: 1000, MaxPacketSize: 1024},
+			Protocols: []string{"udp"},
+		},
+		Routes: []ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:5353", Weight: 100}},
+	}
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for invalid udp policy range")
+	}
+}

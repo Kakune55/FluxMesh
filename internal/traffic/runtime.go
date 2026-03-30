@@ -34,6 +34,7 @@ type Plan struct {
 	listeners        map[string]ListenerPlan
 	listenerMatchers map[string]listenerMatcher
 	tcpBindings      map[string]TCPBinding
+	udpBindings      map[string]UDPBinding
 	backendGroups    map[string]model.BackendGroup
 	backendRelayAddrs map[string]map[string]struct{}
 	backendStrategy  map[string]string
@@ -43,6 +44,12 @@ type Plan struct {
 }
 
 type TCPBinding struct {
+	Listener    ListenerKey `json:"listener"`
+	ServiceName string      `json:"service_name"`
+	Destination string      `json:"destination"`
+}
+
+type UDPBinding struct {
 	Listener    ListenerKey `json:"listener"`
 	ServiceName string      `json:"service_name"`
 	Destination string      `json:"destination"`
@@ -69,6 +76,7 @@ type MatchResult struct {
 func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 	listeners := make(map[string]ListenerPlan)
 	tcpBindings := make(map[string]TCPBinding)
+	udpBindings := make(map[string]UDPBinding)
 	backendGroups := make(map[string]model.BackendGroup)
 	backendRelayAddrs := make(map[string]map[string]struct{})
 	backendStrategy := make(map[string]string)
@@ -117,6 +125,17 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 			}
 			continue
 		}
+		if layer == "l4-udp" {
+			if _, exists := udpBindings[key]; exists {
+				return Plan{}, fmt.Errorf("listener %s already bound by another l4-udp service", key)
+			}
+			udpBindings[key] = UDPBinding{
+				Listener:    ListenerKey{Addr: cfg.TrafficPolicy.Listener.Addr, Port: cfg.TrafficPolicy.Listener.Port},
+				ServiceName: cfg.Name,
+				Destination: cfg.Routes[0].Destination,
+			}
+			continue
+		}
 
 		if _, exists := tcpBindings[key]; exists {
 			return Plan{}, fmt.Errorf("listener %s cannot mix l7-http with l4-tcp service", key)
@@ -160,6 +179,7 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 		listeners:        listeners,
 		listenerMatchers: listenerMatchers,
 		tcpBindings:      tcpBindings,
+		udpBindings:      udpBindings,
 		backendGroups:    backendGroups,
 		backendRelayAddrs: backendRelayAddrs,
 		backendStrategy:  backendStrategy,
@@ -167,6 +187,31 @@ func BuildPlan(services []model.ServiceConfig) (Plan, error) {
 		servicePolicies:  servicePolicies,
 		state:            newPlanState(),
 	}, nil
+}
+
+// UDPBindings 返回按地址端口排序后的 UDP 监听绑定快照。
+func (p Plan) UDPBindings() []UDPBinding {
+	items := make([]UDPBinding, 0, len(p.udpBindings))
+	for _, binding := range p.udpBindings {
+		items = append(items, binding)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Listener.Addr != items[j].Listener.Addr {
+			return items[i].Listener.Addr < items[j].Listener.Addr
+		}
+		return items[i].Listener.Port < items[j].Listener.Port
+	})
+	return items
+}
+
+// UDPBinding 返回指定监听对应的 UDP 绑定。
+func (p Plan) UDPBinding(addr string, port int) (UDPBinding, bool) {
+	key := listenerMapKey(strings.TrimSpace(addr), port)
+	binding, ok := p.udpBindings[key]
+	if !ok {
+		return UDPBinding{}, false
+	}
+	return binding, true
 }
 
 // TCPBindings 返回按地址端口排序后的 TCP 监听绑定快照。
@@ -474,6 +519,8 @@ func orderTargetsByStrategy(groupName string, targets []model.BackendTarget, str
 		return rotated
 	case "random":
 		shuffleBackendTargets(ordered, state)
+	case "latency-first":
+		sortTargetsByLatencyThenWeight(ordered, state)
 	default:
 		sort.SliceStable(ordered, func(i, j int) bool {
 			if ordered[i].Weight != ordered[j].Weight {

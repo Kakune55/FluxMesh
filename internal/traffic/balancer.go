@@ -3,6 +3,7 @@ package traffic
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +15,10 @@ type planState struct {
 	mu         sync.Mutex
 	rrCounters map[string]uint64
 	rng        *rand.Rand
+	latencyEWMA map[string]float64
 }
+
+const latencyEWMAAlpha = 0.2
 
 // Balancer 定义后端目标选择策略的可插拔接口。
 type Balancer interface {
@@ -31,7 +35,43 @@ func newPlanState() *planState {
 	return &planState{
 		rrCounters: make(map[string]uint64),
 		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		latencyEWMA: make(map[string]float64),
 	}
+}
+
+// ObserveLatency 记录某个上游地址的延迟样本（毫秒 EWMA）。
+func (s *planState) ObserveLatency(upstream string, elapsed time.Duration) {
+	if s == nil {
+		return
+	}
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" || elapsed <= 0 {
+		return
+	}
+
+	ms := float64(elapsed.Nanoseconds()) / 1e6
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prev, ok := s.latencyEWMA[upstream]
+	if !ok {
+		s.latencyEWMA[upstream] = ms
+		return
+	}
+	s.latencyEWMA[upstream] = prev*(1-latencyEWMAAlpha) + ms*latencyEWMAAlpha
+}
+
+func (s *planState) snapshotLatencyEWMA() map[string]float64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]float64, len(s.latencyEWMA))
+	for k, v := range s.latencyEWMA {
+		out[k] = v
+	}
+	return out
 }
 
 // RegisterBalancer 注册自定义负载均衡策略。
@@ -157,6 +197,15 @@ func (b *loadFirstBalancer) Pick(_ string, group model.BackendGroup, _ *planStat
 	return best.Addr, nil
 }
 
+type latencyFirstBalancer struct{}
+
+func (b *latencyFirstBalancer) Pick(_ string, group model.BackendGroup, state *planState) (string, error) {
+	ordered := make([]model.BackendTarget, len(group.Targets))
+	copy(ordered, group.Targets)
+	sortTargetsByLatencyThenWeight(ordered, state)
+	return ordered[0].Addr, nil
+}
+
 type roundRobinBalancer struct{}
 
 func (b *roundRobinBalancer) Pick(groupName string, group model.BackendGroup, state *planState) (string, error) {
@@ -170,9 +219,34 @@ func (b *randomBalancer) Pick(_ string, group model.BackendGroup, state *planSta
 	return weightedRandomTarget(group, state)
 }
 
+func sortTargetsByLatencyThenWeight(targets []model.BackendTarget, state *planState) {
+	latencies := map[string]float64{}
+	if state != nil {
+		latencies = state.snapshotLatencyEWMA()
+	}
+
+	sort.SliceStable(targets, func(i, j int) bool {
+		li, hi := latencies[targets[i].Addr]
+		lj, hj := latencies[targets[j].Addr]
+
+		if hi && hj {
+			if li != lj {
+				return li < lj
+			}
+		}
+		if hi != hj {
+			return hi
+		}
+		if targets[i].Weight != targets[j].Weight {
+			return targets[i].Weight > targets[j].Weight
+		}
+		return targets[i].Addr < targets[j].Addr
+	})
+}
+
 func init() {
 	balancerRegistry["load-first"] = &loadFirstBalancer{}
-	balancerRegistry["latency-first"] = &loadFirstBalancer{} // TODO: latency-first 功能待实现
+	balancerRegistry["latency-first"] = &latencyFirstBalancer{}
 	balancerRegistry["round-robin"] = &roundRobinBalancer{}
 	balancerRegistry["random"] = &randomBalancer{}
 }

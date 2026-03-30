@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"fluxmesh/internal/logx"
+	"fluxmesh/internal/model"
 	"fluxmesh/internal/registry"
 )
 
@@ -27,8 +29,17 @@ type Server struct {
 	mu        sync.RWMutex
 	plan      Plan
 	planValue atomic.Value
+	lastServiceSnapshot string
+	serviceWatchRevision int64
 	listeners map[string]*http.Server
 	tcpListeners map[string]net.Listener
+	udpListeners map[string]*net.UDPConn
+	udpListenerOptions map[string]udpRuntimeOptions
+	udpSessionMu sync.Mutex
+	udpSessions map[string]*udpSession
+	udpSessionStop chan struct{}
+	udpSessionStarted atomic.Bool
+	udpSessionWG sync.WaitGroup
 	proxies   map[string]*httputil.ReverseProxy
 	targets   map[string]*url.URL
 	transport *http.Transport
@@ -67,11 +78,27 @@ type TrafficStats struct {
 	RelayLatencyNs     uint64 `json:"relay_latency_ns"`
 }
 
+type udpRuntimeOptions struct {
+	MaxPacketSize int
+	DialTimeout   time.Duration
+	ReadTimeout   time.Duration
+	WriteTimeout  time.Duration
+	SessionTTL    time.Duration
+}
+
+type udpSession struct {
+	conn     *net.UDPConn
+	mu       sync.Mutex
+	lastUsed time.Time
+}
+
 const (
 	headerFluxMeshService     = "X-FluxMesh-Service"
 	headerFluxMeshDestination = "X-FluxMesh-Destination"
 	headerFluxMeshUpstream    = "X-FluxMesh-Upstream"
 	headerFluxMeshHops        = "X-FluxMesh-Hops"
+	fallbackRefreshInterval   = 30 * time.Second
+	watchReconnectDelay       = 1 * time.Second
 )
 
 // NewServer 创建流量面运行时实例并初始化监听器与代理缓存。
@@ -86,6 +113,10 @@ func NewServer(services *registry.Services) *Server {
 		services:  services,
 		listeners: make(map[string]*http.Server),
 		tcpListeners: make(map[string]net.Listener),
+		udpListeners: make(map[string]*net.UDPConn),
+		udpListenerOptions: make(map[string]udpRuntimeOptions),
+		udpSessions: make(map[string]*udpSession),
+		udpSessionStop: make(chan struct{}),
 		proxies:   make(map[string]*httputil.ReverseProxy),
 		targets:   make(map[string]*url.URL),
 		transport: transport,
@@ -106,8 +137,10 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.refresh(ctx); err != nil {
 		return err
 	}
+	s.startUDPSessionReaper()
 	s.startMetricsAggregator()
 
+	go s.watchServicesLoop(ctx)
 	go s.reconcileLoop(ctx)
 	return nil
 }
@@ -123,8 +156,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for _, ln := range s.tcpListeners {
 		tcpListeners = append(tcpListeners, ln)
 	}
+	udpListeners := make([]*net.UDPConn, 0, len(s.udpListeners))
+	for _, conn := range s.udpListeners {
+		udpListeners = append(udpListeners, conn)
+	}
+	udpSessions := make([]*net.UDPConn, 0, len(s.udpSessions))
+	for _, session := range s.udpSessions {
+		udpSessions = append(udpSessions, session.conn)
+	}
 	s.listeners = make(map[string]*http.Server)
 	s.tcpListeners = make(map[string]net.Listener)
+	s.udpListeners = make(map[string]*net.UDPConn)
+	s.udpListenerOptions = make(map[string]udpRuntimeOptions)
+	s.udpSessions = make(map[string]*udpSession)
 	s.mu.Unlock()
 
 	var firstErr error
@@ -138,13 +182,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	for _, conn := range udpListeners {
+		if err := conn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for _, conn := range udpSessions {
+		if err := conn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	s.stopUDPSessionReaper()
 	s.stopMetricsAggregator()
 	return firstErr
 }
 
 // reconcileLoop 定时刷新服务配置并收敛监听状态。
 func (s *Server) reconcileLoop(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(fallbackRefreshInterval)
 	defer ticker.Stop()
 
 	for {
@@ -153,9 +208,50 @@ func (s *Server) reconcileLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := s.refresh(ctx); err != nil {
-				logx.Warn("流量面监听规划刷新失败", "err", err)
+				logx.Warn("流量面监听规划兜底刷新失败", "err", err)
 			}
 		}
+	}
+}
+
+func (s *Server) watchServicesLoop(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		watchRevision := s.getServiceWatchRevision()
+		watchCh := s.services.Watch(ctx, watchRevision)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case resp, ok := <-watchCh:
+				if !ok {
+					goto reconnect
+				}
+				if err := resp.Err(); err != nil {
+					logx.Warn("流量面 watch services 失败，准备重连", "rev", watchRevision, "err", err)
+					if refreshErr := s.refresh(ctx); refreshErr != nil {
+						logx.Warn("流量面 watch 失败后的刷新失败", "err", refreshErr)
+					}
+					goto reconnect
+				}
+				if len(resp.Events) == 0 {
+					continue
+				}
+				if err := s.refresh(ctx); err != nil {
+					logx.Warn("流量面 watch 事件刷新失败", "err", err)
+				}
+			}
+		}
+
+	reconnect:
+		if ctx.Err() != nil {
+			return
+		}
+		time.Sleep(watchReconnectDelay)
 	}
 }
 
@@ -165,6 +261,20 @@ func (s *Server) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	nextWatchRev := nextServiceWatchRevision(items)
+
+	snapshot := serviceSnapshotKey(items)
+	s.mu.RLock()
+	if snapshot == s.lastServiceSnapshot {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		if nextWatchRev > s.serviceWatchRevision {
+			s.serviceWatchRevision = nextWatchRev
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.RUnlock()
 
 	plan, err := BuildPlan(items)
 	if err != nil {
@@ -179,6 +289,14 @@ func (s *Server) refresh(ctx context.Context) error {
 	for _, binding := range plan.TCPBindings() {
 		desiredTCP[listenerMapKey(binding.Listener.Addr, binding.Listener.Port)] = binding
 	}
+	desiredUDP := make(map[string]UDPBinding)
+	desiredUDPOptions := make(map[string]udpRuntimeOptions)
+	for _, binding := range plan.UDPBindings() {
+		key := listenerMapKey(binding.Listener.Addr, binding.Listener.Port)
+		desiredUDP[key] = binding
+		policy, _ := plan.ServicePolicy(binding.ServiceName)
+		desiredUDPOptions[key] = buildUDPRuntimeOptions(policy)
+	}
 
 	s.mu.Lock()
 	if s.plan.state != nil {
@@ -187,6 +305,10 @@ func (s *Server) refresh(ctx context.Context) error {
 	}
 	s.plan = plan
 	s.planValue.Store(plan)
+	s.lastServiceSnapshot = snapshot
+	if nextWatchRev > s.serviceWatchRevision {
+		s.serviceWatchRevision = nextWatchRev
+	}
 
 	for key, srv := range s.listeners {
 		if _, ok := desired[key]; ok {
@@ -209,6 +331,18 @@ func (s *Server) refresh(ctx context.Context) error {
 		delete(s.tcpListeners, key)
 		if err := ln.Close(); err != nil {
 			logx.Warn("TCP 流量监听关闭失败", "listener", key, "err", err)
+		}
+	}
+
+	for key, conn := range s.udpListeners {
+		if _, ok := desiredUDP[key]; ok {
+			s.udpListenerOptions[key] = desiredUDPOptions[key]
+			continue
+		}
+		delete(s.udpListeners, key)
+		delete(s.udpListenerOptions, key)
+		if err := conn.Close(); err != nil {
+			logx.Warn("UDP 流量监听关闭失败", "listener", key, "err", err)
 		}
 	}
 
@@ -250,9 +384,300 @@ func (s *Server) refresh(ctx context.Context) error {
 		go s.acceptTCPLoop(binding.Listener, ln)
 		logx.Info("TCP 流量监听已启动", "addr", addr)
 	}
+
+	for key, binding := range desiredUDP {
+		if _, ok := s.udpListeners[key]; ok {
+			continue
+		}
+
+		addr := net.JoinHostPort(binding.Listener.Addr, strconv.Itoa(binding.Listener.Port))
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			logx.Error("UDP 流量监听地址解析失败", "addr", addr, "err", err)
+			continue
+		}
+		conn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			logx.Error("UDP 流量监听启动失败", "addr", addr, "err", err)
+			continue
+		}
+
+		s.udpListeners[key] = conn
+		s.udpListenerOptions[key] = desiredUDPOptions[key]
+		go s.acceptUDPLoop(binding.Listener, conn, desiredUDPOptions[key])
+		logx.Info("UDP 流量监听已启动", "addr", addr)
+	}
 	s.mu.Unlock()
 
 	return nil
+}
+
+func (s *Server) getServiceWatchRevision() int64 {
+	s.mu.RLock()
+	rev := s.serviceWatchRevision
+	s.mu.RUnlock()
+	if rev <= 0 {
+		return 1
+	}
+	return rev
+}
+
+func nextServiceWatchRevision(items []model.ServiceConfig) int64 {
+	maxRev := int64(0)
+	for _, item := range items {
+		if item.ResourceVersion > maxRev {
+			maxRev = item.ResourceVersion
+		}
+	}
+	if maxRev <= 0 {
+		return 1
+	}
+	return maxRev + 1
+}
+
+func serviceSnapshotKey(items []model.ServiceConfig) string {
+	if len(items) == 0 {
+		return "empty"
+	}
+
+	type entry struct {
+		name string
+		rev  int64
+	}
+
+	entries := make([]entry, 0, len(items))
+	for _, it := range items {
+		entries = append(entries, entry{name: strings.TrimSpace(it.Name), rev: it.ResourceVersion})
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].name != entries[j].name {
+			return entries[i].name < entries[j].name
+		}
+		return entries[i].rev < entries[j].rev
+	})
+
+	var b strings.Builder
+	b.Grow(len(entries) * 24)
+	b.WriteString("n=")
+	b.WriteString(strconv.Itoa(len(entries)))
+	for _, e := range entries {
+		b.WriteByte('|')
+		b.WriteString(e.name)
+		b.WriteByte('@')
+		b.WriteString(strconv.FormatInt(e.rev, 10))
+	}
+	return b.String()
+}
+
+func (s *Server) acceptUDPLoop(listener ListenerKey, conn *net.UDPConn, options udpRuntimeOptions) {
+	buf := make([]byte, options.MaxPacketSize)
+	for {
+		n, clientAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			logx.Warn("UDP 报文接入失败", "listener", listenerMapKey(listener.Addr, listener.Port), "err", err)
+			continue
+		}
+		if n <= 0 || clientAddr == nil {
+			continue
+		}
+
+		payload := append([]byte(nil), buf[:n]...)
+		go s.handleUDPPacket(conn, clientAddr, payload, listener)
+	}
+}
+
+func (s *Server) handleUDPPacket(listenerConn *net.UDPConn, clientAddr *net.UDPAddr, payload []byte, listener ListenerKey) {
+	plan := s.currentPlan()
+	binding, ok := plan.UDPBinding(listener.Addr, listener.Port)
+	if !ok {
+		return
+	}
+
+	policy, _ := plan.ServicePolicy(binding.ServiceName)
+	options := buildUDPRuntimeOptions(policy)
+	maxAttempts := effectiveMaxAttempts(policy.Retry.MaxAttempts)
+	maxAttempts = applyRetryBudget(maxAttempts, policy.Retry.BudgetRatio)
+
+	candidates, err := plan.ResolveDestinationsForAttempts(binding.Destination, maxAttempts)
+	if err != nil {
+		logx.Warn("UDP 目标解析失败", "service", binding.ServiceName, "destination", binding.Destination, "err", err)
+		return
+	}
+
+	var lastErr error
+	for _, candidate := range candidates {
+		dialAddr, err := udpDialAddress(candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		roundStartedAt := time.Now()
+		session, err := s.getOrCreateUDPSession(listener, clientAddr, dialAddr, options)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		respBuf, err := s.roundTripUDPSession(session, payload, options)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(respBuf) == 0 {
+			continue
+		}
+
+		s.observeUpstreamLatency(candidate, time.Since(roundStartedAt))
+		if _, err := listenerConn.WriteToUDP(respBuf, clientAddr); err != nil {
+			logx.Warn("UDP 回写客户端失败", "listener", listenerMapKey(listener.Addr, listener.Port), "client", clientAddr.String(), "err", err)
+		}
+		return
+	}
+
+	if lastErr != nil {
+		logx.Warn("UDP 上游连接失败", "service", binding.ServiceName, "destination", binding.Destination, "err", lastErr)
+	}
+}
+
+func buildUDPRuntimeOptions(policy model.ServiceTrafficPolicy) udpRuntimeOptions {
+	return udpRuntimeOptions{
+		MaxPacketSize: policy.UDP.MaxPacketSize,
+		DialTimeout:   time.Duration(policy.UDP.DialTimeoutMs) * time.Millisecond,
+		ReadTimeout:   time.Duration(policy.UDP.ReadTimeoutMs) * time.Millisecond,
+		WriteTimeout:  time.Duration(policy.UDP.WriteTimeoutMs) * time.Millisecond,
+		SessionTTL:    time.Duration(policy.UDP.SessionTTLMs) * time.Millisecond,
+	}
+}
+
+func udpSessionKey(listener ListenerKey, clientAddr *net.UDPAddr, upstream string) string {
+	return listenerMapKey(listener.Addr, listener.Port) + "|" + clientAddr.String() + "|" + strings.TrimSpace(upstream)
+}
+
+func (s *Server) getOrCreateUDPSession(listener ListenerKey, clientAddr *net.UDPAddr, upstream string, options udpRuntimeOptions) (*udpSession, error) {
+	key := udpSessionKey(listener, clientAddr, upstream)
+	now := time.Now()
+
+	s.udpSessionMu.Lock()
+	if existing, ok := s.udpSessions[key]; ok {
+		if now.Sub(existing.lastUsed) <= options.SessionTTL {
+			existing.lastUsed = now
+			s.udpSessionMu.Unlock()
+			return existing, nil
+		}
+		delete(s.udpSessions, key)
+		_ = existing.conn.Close()
+	}
+	s.udpSessionMu.Unlock()
+
+	upstreamConn, err := net.DialTimeout("udp", upstream, options.DialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	udpConn, ok := upstreamConn.(*net.UDPConn)
+	if !ok {
+		_ = upstreamConn.Close()
+		return nil, fmt.Errorf("unexpected udp connection type")
+	}
+
+	session := &udpSession{conn: udpConn, lastUsed: now}
+	s.udpSessionMu.Lock()
+	if s.udpSessions == nil {
+		s.udpSessions = make(map[string]*udpSession)
+	}
+	if existing, ok := s.udpSessions[key]; ok {
+		s.udpSessionMu.Unlock()
+		_ = udpConn.Close()
+		return existing, nil
+	}
+	s.udpSessions[key] = session
+	s.udpSessionMu.Unlock()
+
+	return session, nil
+}
+
+func (s *Server) roundTripUDPSession(session *udpSession, payload []byte, options udpRuntimeOptions) ([]byte, error) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if err := session.conn.SetWriteDeadline(time.Now().Add(options.WriteTimeout)); err != nil {
+		return nil, err
+	}
+	if _, err := session.conn.Write(payload); err != nil {
+		return nil, err
+	}
+
+	respBuf := make([]byte, options.MaxPacketSize)
+	if err := session.conn.SetReadDeadline(time.Now().Add(options.ReadTimeout)); err != nil {
+		return nil, err
+	}
+	n, err := session.conn.Read(respBuf)
+	if err != nil {
+		return nil, err
+	}
+	if n <= 0 {
+		return nil, nil
+	}
+
+	s.udpSessionMu.Lock()
+	session.lastUsed = time.Now()
+	s.udpSessionMu.Unlock()
+
+	return respBuf[:n], nil
+}
+
+func (s *Server) startUDPSessionReaper() {
+	if !s.udpSessionStarted.CompareAndSwap(false, true) {
+		return
+	}
+	s.udpSessionWG.Add(1)
+	go func() {
+		defer s.udpSessionWG.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.udpSessionStop:
+				return
+			case <-ticker.C:
+				s.reapUDPSessions()
+			}
+		}
+	}()
+}
+
+func (s *Server) stopUDPSessionReaper() {
+	if !s.udpSessionStarted.CompareAndSwap(true, false) {
+		return
+	}
+	close(s.udpSessionStop)
+	s.udpSessionWG.Wait()
+}
+
+func (s *Server) reapUDPSessions() {
+	now := time.Now()
+	plan := s.currentPlan()
+	s.udpSessionMu.Lock()
+	for key, session := range s.udpSessions {
+		ttl := 30 * time.Second
+		parts := strings.SplitN(key, "|", 2)
+		if len(parts) == 2 {
+			if binding, ok := plan.udpBindings[parts[0]]; ok {
+				if policy, ok := plan.ServicePolicy(binding.ServiceName); ok {
+					ttl = time.Duration(policy.UDP.SessionTTLMs) * time.Millisecond
+				}
+			}
+		}
+		if now.Sub(session.lastUsed) <= ttl {
+			continue
+		}
+		delete(s.udpSessions, key)
+		_ = session.conn.Close()
+	}
+	s.udpSessionMu.Unlock()
 }
 
 func (s *Server) acceptTCPLoop(listener ListenerKey, ln net.Listener) {
@@ -297,11 +722,13 @@ func (s *Server) handleTCPConn(client net.Conn, listener ListenerKey) {
 			continue
 		}
 
+		dialStartedAt := time.Now()
 		upstream, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
 		if err != nil {
 			lastErr = err
 			continue
 		}
+		s.observeUpstreamLatency(candidate, time.Since(dialStartedAt))
 
 		proxyTCP(client, upstream)
 		return
@@ -322,6 +749,36 @@ func tcpDialAddress(destination string) (string, error) {
 		u, err := url.Parse(destination)
 		if err != nil {
 			return "", fmt.Errorf("invalid destination url: %w", err)
+		}
+		if strings.TrimSpace(u.Host) == "" {
+			return "", fmt.Errorf("destination host is required")
+		}
+		if _, _, err := net.SplitHostPort(u.Host); err != nil {
+			return "", fmt.Errorf("destination host must be host:port")
+		}
+		return u.Host, nil
+	}
+
+	if _, _, err := net.SplitHostPort(destination); err != nil {
+		return "", fmt.Errorf("destination must be host:port")
+	}
+
+	return destination, nil
+}
+
+func udpDialAddress(destination string) (string, error) {
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return "", fmt.Errorf("destination is empty")
+	}
+
+	if strings.Contains(destination, "://") {
+		u, err := url.Parse(destination)
+		if err != nil {
+			return "", fmt.Errorf("invalid destination url: %w", err)
+		}
+		if u.Scheme != "udp" {
+			return "", fmt.Errorf("unsupported destination scheme: %s", u.Scheme)
 		}
 		if strings.TrimSpace(u.Host) == "" {
 			return "", fmt.Errorf("destination host is required")
@@ -424,11 +881,13 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		r.Header.Set(headerFluxMeshUpstream, resolved)
 		r.Header.Set(headerFluxMeshHops, strconv.Itoa(incomingHops+1))
 
+		forwardStartedAt := time.Now()
 		statusCode, err := s.forwardDirect(w, r, target)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return http.StatusBadGateway, 1, relayHit, sampleRate
 		}
+		s.observeUpstreamLatency(resolved, time.Since(forwardStartedAt))
 		return statusCode, 1, relayHit, sampleRate
 	}
 
@@ -453,11 +912,13 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		r.Header.Set(headerFluxMeshUpstream, resolved)
 		r.Header.Set(headerFluxMeshHops, strconv.Itoa(incomingHops+1))
 
+		forwardStartedAt := time.Now()
 		statusCode, err := s.forwardDirect(w, r, target)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return http.StatusBadGateway, 1, relayHit, sampleRate
 		}
+		s.observeUpstreamLatency(resolved, time.Since(forwardStartedAt))
 		return statusCode, 1, relayHit, sampleRate
 	}
 
@@ -498,9 +959,13 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, listener L
 		attemptReq.Header.Set(headerFluxMeshUpstream, resolved)
 		attemptReq.Header.Set(headerFluxMeshHops, strconv.Itoa(incomingHops+1))
 
+		attemptStartedAt := time.Now()
 		rw := acquireRetryBufferWriter()
 		proxy.ServeHTTP(rw, attemptReq)
 		statusCode := rw.StatusCode()
+		if !shouldRetryStatus(statusCode) {
+			s.observeUpstreamLatency(resolved, time.Since(attemptStartedAt))
+		}
 
 		if !shouldRetryStatus(statusCode) || attempt == len(candidates)-1 {
 			writeRetryBufferedResponse(w, rw)
@@ -528,6 +993,14 @@ func (s *Server) currentPlan() Plan {
 	plan := s.plan
 	s.mu.RUnlock()
 	return plan
+}
+
+func (s *Server) observeUpstreamLatency(upstream string, elapsed time.Duration) {
+	plan := s.currentPlan()
+	if plan.state == nil {
+		return
+	}
+	plan.state.ObserveLatency(upstream, elapsed)
 }
 
 func (s *Server) recordTrafficMetrics(elapsed time.Duration, statusCode int, attemptsUsed int, relayHit bool, sampleRate uint32) {

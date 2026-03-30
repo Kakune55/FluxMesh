@@ -1,6 +1,6 @@
 # FluxMesh 流量面详细设计
 
-版本：v1.0（2026-03-20）
+版本：v1.1（2026-03-24）
 
 ## 1. 设计基线
 
@@ -39,6 +39,11 @@ ServiceConfig 关键字段：
 - protocols
 - listener.addr
 - listener.port
+- udp.dial_timeout_ms
+- udp.read_timeout_ms
+- udp.write_timeout_ms
+- udp.session_ttl_ms
+- udp.max_packet_size
 - lb.strategy
 - retry.max_attempts
 - retry.budget_ratio
@@ -49,8 +54,13 @@ ServiceConfig 关键字段：
 
 - listener.addr = 0.0.0.0
 - proxy.layer = l7-http
-- protocols = [http]（proxy.layer=l7-http）或 [tcp]（proxy.layer=l4-tcp）
+- protocols = [http]（proxy.layer=l7-http）、[tcp]（proxy.layer=l4-tcp）或 [udp]（proxy.layer=l4-udp）
 - observability.metrics_sample_rate = 1
+- udp.dial_timeout_ms = 2000
+- udp.read_timeout_ms = 2000
+- udp.write_timeout_ms = 2000
+- udp.session_ttl_ms = 30000
+- udp.max_packet_size = 65535
 - routes[].hosts = [*]
 - routes[].weight = 100
 - backend_groups[].targets[].weight = 100
@@ -60,10 +70,15 @@ ServiceConfig 关键字段：
 - name 必填
 - listener.port 范围为 1 到 65535
 - listener.addr 必须是可绑定 IPv4
-- proxy.layer 仅允许 l7-http 或 l4-tcp
-- protocols 至少一个，且按 proxy.layer 校验：l7-http 仅允许 http，l4-tcp 仅允许 tcp
+- proxy.layer 仅允许 l7-http、l4-tcp 或 l4-udp
+- protocols 至少一个，且按 proxy.layer 校验：l7-http 仅允许 http，l4-tcp 仅允许 tcp，l4-udp 仅允许 udp
 - lb.strategy 允许内置策略与别名，也允许匹配 [a-z0-9-] 的自定义名
 - observability.metrics_sample_rate 范围为 1 到 10000
+- udp.dial_timeout_ms 范围为 1 到 60000
+- udp.read_timeout_ms 范围为 1 到 60000
+- udp.write_timeout_ms 范围为 1 到 60000
+- udp.session_ttl_ms 范围为 100 到 3600000
+- udp.max_packet_size 范围为 512 到 65535
 - routes 至少一个
 - route.path_prefix 必须以 / 开头
 - route.weight 范围为 1 到 100
@@ -81,13 +96,15 @@ BuildPlan 过程：
 2. 以 listener.addr + listener.port 作为监听合并键。
 3. 若 proxy.layer=l7-http：将路由展平成 RouteBinding 并归并到 HTTP 监听维度。
 4. 若 proxy.layer=l4-tcp：生成 TCPBinding（每监听仅允许一个 l4-tcp 服务绑定）。
-5. 预构建 Host 匹配桶：exact host 与 wildcard host（仅 HTTP）。
-6. 为 backend_group 记录策略和 relay 候选索引。
+5. 若 proxy.layer=l4-udp：生成 UDPBinding（每监听仅允许一个 l4-udp 服务绑定）。
+6. 预构建 Host 匹配桶：exact host 与 wildcard host（仅 HTTP）。
+7. 为 backend_group 记录策略和 relay 候选索引。
 
 监听冲突规则：
 
 - 同一 listener.addr + listener.port 不允许 l7-http 与 l4-tcp 混用。
 - 同一 listener.addr + listener.port 不允许绑定多个 l4-tcp 服务。
+- 同一 listener.addr + listener.port 不允许绑定多个 l4-udp 服务。
 
 ### 3.2 匹配优先级
 
@@ -123,7 +140,7 @@ BuildPlan 过程：
   - load-first：权重降序
   - round-robin：按组状态轮转
   - random：按权重随机
-  - latency-first：当前与 load-first 一致（预留）
+  - latency-first：按本节点观测的上游时延 EWMA 升序，缺失观测时按权重降序
 
 ## 5. 转发与重试
 
@@ -135,6 +152,17 @@ BuildPlan 过程：
 - destination 解析后得到候选地址，按重试预算顺序尝试拨号。
 - 成功后进行双向字节流转发（io.Copy 双协程）。
 - 当前为纯透传模式，不参与 Host/Path 匹配。
+
+### 5.00 L4-UDP 转发路径
+
+当 proxy.layer=l4-udp：
+
+- 运行时建立 UDP listener，并基于监听键查找 UDPBinding。
+- destination 解析后得到候选地址，按重试预算顺序尝试。
+- 单次尝试执行：写上游报文 -> 读取上游响应 -> 回写客户端。
+- 按 listener + client + upstream 维度复用 UDP 会话，降低每包 Dial 开销。
+- 超时与缓冲区可按服务级 udp.* 参数配置。
+- 当前为基础报文透传，不参与 Host/Path 匹配。
 
 ### 5.1 单尝试路径
 
@@ -220,6 +248,7 @@ BuildPlan 过程：
 - 服务级监听声明与同端口复用
 - Host + Path 路由匹配
 - L4-TCP 基础代理透传（listener 绑定 + 连接转发）
+- L4-UDP 基础代理透传（listener 绑定 + 报文转发）
 - backend group + 直连 + 服务名回落三类 destination
 - 负载策略插件化注册机制
 - 重试预算与 relay 候选切换
@@ -228,7 +257,7 @@ BuildPlan 过程：
 未实现或预留：
 
 - 全局 traffic 配置层（当前仅服务级）
-- 真正的 latency-first 指标驱动打分
+- latency-first 的跨节点全局指标驱动打分（当前为节点内本地时延感知）
 - gRPC 等更高层协议治理能力
 - L4 高级能力（如 SNI/四元组路由、连接级熔断）
 

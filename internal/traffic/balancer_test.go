@@ -191,3 +191,27 @@ func TestLoadFirstBalancerPick(t *testing.T) {
 		t.Fatalf("expected lexicographically smaller addr on tie, got %s", got)
 	}
 }
+
+func TestLatencyFirstBalancerPrefersObservedLatency(t *testing.T) {
+	b := &latencyFirstBalancer{}
+	state := newPlanState()
+
+	state.ObserveLatency("127.0.0.1:28081", 40*time.Millisecond)
+	state.ObserveLatency("127.0.0.1:28082", 5*time.Millisecond)
+
+	group := model.BackendGroup{
+		Name: "latency-pick",
+		Targets: []model.BackendTarget{
+			{Addr: "127.0.0.1:28081", Weight: 100},
+			{Addr: "127.0.0.1:28082", Weight: 10},
+		},
+	}
+
+	got, err := b.Pick("latency-pick", group, state)
+	if err != nil {
+		t.Fatalf("latency-first pick failed: %v", err)
+	}
+	if got != "127.0.0.1:28082" {
+		t.Fatalf("expected lower-latency target 127.0.0.1:28082, got %s", got)
+	}
+}

@@ -3,7 +3,9 @@ package registry_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"fluxmesh/internal/model"
 	"fluxmesh/internal/registry"
@@ -72,5 +74,44 @@ func TestServicesCASFlow(t *testing.T) {
 	_, err = svc.Get(ctx, got.Name)
 	if !errors.Is(err, registry.ErrServiceNotFound) {
 		t.Fatalf("expected not found after delete, got %v", err)
+	}
+}
+
+func TestServicesWatch(t *testing.T) {
+	emb := etcdtest.Start(t)
+	svc := registry.NewServices(emb.Client)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ch := svc.Watch(ctx, 1)
+
+	seed := model.ServiceConfig{
+		Name: "watch-svc",
+		TrafficPolicy: model.ServiceTrafficPolicy{
+			Listener: model.ListenerPolicy{Port: 18080},
+		},
+		Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "watch-v1", Weight: 100}},
+	}
+	if err := svc.Put(ctx, seed); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+
+	select {
+	case resp, ok := <-ch:
+		if !ok {
+			t.Fatalf("watch channel closed unexpectedly")
+		}
+		if err := resp.Err(); err != nil {
+			t.Fatalf("watch response error: %v", err)
+		}
+		if len(resp.Events) == 0 {
+			t.Fatalf("expected at least one watch event")
+		}
+		if !strings.HasPrefix(string(resp.Events[0].Kv.Key), "/mesh/services/") {
+			t.Fatalf("unexpected watch key: %s", string(resp.Events[0].Kv.Key))
+		}
+	case <-ctx.Done():
+		t.Fatalf("watch timeout waiting for put event")
 	}
 }

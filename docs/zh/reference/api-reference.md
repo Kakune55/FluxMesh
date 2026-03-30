@@ -219,8 +219,8 @@ stats 内部字段：
 
 ### 4.2 traffic_policy 常用字段
 
-- proxy.layer：l7-http 或 l4-tcp，默认 l7-http
-- protocols：l7-http 只能是 http，l4-tcp 只能是 tcp
+- proxy.layer：l7-http、l4-tcp 或 l4-udp，默认 l7-http
+- protocols：l7-http 只能是 http，l4-tcp 只能是 tcp，l4-udp 只能是 udp
 - listener.addr：默认 0.0.0.0
 - listener.port：1 到 65535
 - lb.strategy：load-first、round-robin、random、latency-first，或自定义 [a-z0-9-]
@@ -228,6 +228,11 @@ stats 内部字段：
 - retry.budget_ratio：默认 1
 - relay.max_hops：默认 2
 - observability.metrics_sample_rate：默认 1，范围 1 到 10000
+- udp.dial_timeout_ms：默认 2000，范围 1 到 60000
+- udp.read_timeout_ms：默认 2000，范围 1 到 60000
+- udp.write_timeout_ms：默认 2000，范围 1 到 60000
+- udp.session_ttl_ms：默认 30000，范围 100 到 3600000
+- udp.max_packet_size：默认 65535，范围 512 到 65535
 
 ### 4.3 路由和后端组约束
 

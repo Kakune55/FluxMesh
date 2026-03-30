@@ -363,6 +363,57 @@ func TestBuildPlanRejectMixHTTPAndTCPOnSameListener(t *testing.T) {
 	}
 }
 
+func TestBuildPlanUDPBindings(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "udp-gateway",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Proxy:    model.ProxyPolicy{Layer: "l4-udp"},
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 19091},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:5353", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	if len(plan.UDPBindings()) != 1 {
+		t.Fatalf("expected 1 udp binding, got %d", len(plan.UDPBindings()))
+	}
+	if _, ok := plan.UDPBinding("0.0.0.0", 19091); !ok {
+		t.Fatalf("expected udp binding lookup success")
+	}
+}
+
+func TestBuildPlanRejectDuplicateUDPBinding(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "udp-gateway-a",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Proxy:    model.ProxyPolicy{Layer: "l4-udp"},
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 19091},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:5353", Weight: 100}},
+		},
+		{
+			Name: "udp-gateway-b",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Proxy:    model.ProxyPolicy{Layer: "l4-udp"},
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 19091},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "127.0.0.1:5354", Weight: 100}},
+		},
+	}
+
+	_, err := BuildPlan(services)
+	if err == nil {
+		t.Fatalf("expected duplicate udp binding error")
+	}
+}
+
 func TestResolveDestinationLatencyFirstStrategy(t *testing.T) {
 	services := []model.ServiceConfig{
 		{
@@ -395,6 +446,44 @@ func TestResolveDestinationLatencyFirstStrategy(t *testing.T) {
 	}
 	if resolved != "127.0.0.1:28082" {
 		t.Fatalf("expected highest-priority target 127.0.0.1:28082, got %s", resolved)
+	}
+}
+
+func TestResolveDestinationLatencyFirstUsesObservedLatency(t *testing.T) {
+	services := []model.ServiceConfig{
+		{
+			Name: "payment-svc",
+			TrafficPolicy: model.ServiceTrafficPolicy{
+				Listener: model.ListenerPolicy{Addr: "0.0.0.0", Port: 18080},
+				LB:       model.LBPolicy{Strategy: "latency-first"},
+			},
+			BackendGroups: []model.BackendGroup{
+				{
+					Name: "payment-v1",
+					Targets: []model.BackendTarget{
+						{Addr: "127.0.0.1:28081", Weight: 100},
+						{Addr: "127.0.0.1:28082", Weight: 10},
+					},
+				},
+			},
+			Routes: []model.ServiceRoute{{PathPrefix: "/", Destination: "payment-v1", Weight: 100}},
+		},
+	}
+
+	plan, err := BuildPlan(services)
+	if err != nil {
+		t.Fatalf("build plan failed: %v", err)
+	}
+
+	plan.state.ObserveLatency("127.0.0.1:28081", 50)
+	plan.state.ObserveLatency("127.0.0.1:28082", 5)
+
+	resolved, err := plan.ResolveDestination("payment-v1")
+	if err != nil {
+		t.Fatalf("resolve latency-first failed: %v", err)
+	}
+	if resolved != "127.0.0.1:28082" {
+		t.Fatalf("expected lower-latency target 127.0.0.1:28082, got %s", resolved)
 	}
 }
 
