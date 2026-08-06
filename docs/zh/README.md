@@ -1,50 +1,41 @@
-# FluxMesh 中文文档总入口
+# FluxMesh 文档
 
-这是一份面向使用者和协作者的中文文档导航页。建议按“先上手、再理解架构、最后看实现细节”的顺序阅读。
+本文档集描述当前代码实现。
+代码与文档冲突时，以代码为准。
 
-## 推荐阅读顺序
+## 阅读顺序
 
-1. [快速开始](getting-started.md)
-2. [控制面白皮书](architecture/control-plane-whitepaper.md)
-3. [控制面设计](architecture/control-plane-design.md)
-4. [流量面架构](architecture/traffic-plane-architecture.md)
-5. [流量面详细设计](design/traffic-plane-design.md)
-6. [软状态KV与Gossip设计方案](design/soft-kv-and-gossip.md)
-7. [API 与配置参考](reference/api-reference.md)
+1. 阅读[快速开始](getting-started.md)。
+2. 阅读[项目架构](architecture/overview.md)。
+3. 按需阅读各模块设计。
+4. 联调时查看[API 与配置参考](reference/api-reference.md)。
 
-## 按用途查找
+## 文档结构
 
-### 上手运行
+| 文档 | 内容 |
+| --- | --- |
+| [快速开始](getting-started.md) | 构建、启动和基础验证 |
+| [项目架构](architecture/overview.md) | 系统边界、组件和数据流 |
+| [控制面设计](architecture/control-plane-design.md) | etcd、自举、租约和治理 |
+| [控制面取舍](architecture/control-plane-whitepaper.md) | 角色、存储和一致性取舍 |
+| [控制面架构图](architecture/control-plane-architecture.drawio) | 控制面和 SoftKV 图示 |
+| [流量面架构](architecture/traffic-plane-architecture.md) | 流量面边界和处理链路 |
+| [流量面详细设计](design/traffic-plane-design.md) | 配置编译、转发和重试 |
+| [SoftKV 设计](design/soft-kv-and-gossip.md) | 软状态存储和 Gossip |
+| [API 与配置参考](reference/api-reference.md) | 接口、字段和启动参数 |
 
-- [快速开始](getting-started.md)
+## 文档约定
 
-### 控制面理解
+- `Server` 和 `Agent` 表示节点角色。
+- `etcd member` 表示 Raft 成员。
+- `节点注册键` 表示 `/mesh/nodes/{id}`。
+- `服务配置` 表示 `/mesh/services/{name}`。
+- `SoftKV` 表示进程内软状态存储。
+- `流量面` 表示 `internal/traffic` 运行时。
 
-- [控制面白皮书](architecture/control-plane-whitepaper.md)
-- [控制面设计](architecture/control-plane-design.md)
-- [控制面架构图](architecture/control-plane-architecture.drawio)
+## 实现边界
 
-### 流量面理解
-
-- [流量面架构](architecture/traffic-plane-architecture.md)
-- [流量面详细设计](design/traffic-plane-design.md)
-
-### SoftKV 理解
-
-- [软状态KV与Gossip设计方案](design/soft-kv-and-gossip.md)
-
-### 参考页
-
-- [API 与配置参考](reference/api-reference.md)
-
-## 读文档时的建议
-
-- 如果你是第一次接触项目，先看快速开始，再看控制面白皮书。
-- 如果你关心运行时行为，优先看流量面架构和详细设计。
-- 如果你关心高频指标与软状态收敛，先看 SoftKV 方案。
-- 如果你想直接联调接口，快速开始里已经按场景整理了验证命令。
-
-## 当前文档边界
-
-- 这里的文档以当前代码实现为准。
-- 已写明的 Future Work 只代表后续方向，不代表当前已实现。
+当前版本不提供管理接口鉴权。
+当前版本不接入 Envoy 或 xDS。
+当前版本不劫持主机流量。
+调用方必须显式声明监听端口。

@@ -1,167 +1,124 @@
-# FluxMesh 流量面架构文档
+# FluxMesh 流量面架构
 
-版本：v1.1（2026-03-24）
+## 1. 范围
 
-## 1. 文档范围
+流量面读取服务配置。
+流量面创建本地监听。
+流量面代理 L7 HTTP、L4 TCP 和 L4 UDP。
 
-本文档描述 FluxMesh 当前代码已实现的流量面架构。内容以 internal/traffic、internal/model、internal/httpapi、internal/registry 的现状为准。
+流量面不劫持主机流量。
+流量面也不使用 Envoy。
+每个 FluxMesh 节点独立运行流量面。
 
-目标：
+## 2. 组件
 
-- 明确流量面的运行时组件与职责边界
-- 明确与控制面数据源和管理接口的关系
-- 明确请求在节点内的处理路径
+| 组件 | 职责 |
+| --- | --- |
+| `ServiceConfig` | 声明路由、后端和策略 |
+| `registry.Services` | 从 etcd 读取服务配置 |
+| `BuildPlan` | 编译监听、路由和目标索引 |
+| `traffic.Server` | 收敛监听并代理流量 |
+| 管理接口 | 显示 L7 计划、模拟匹配和读取统计 |
 
-非目标：
+## 3. 运行计划
 
-- 不描述尚未实现的 eBPF/iptables 劫持
-- 不描述 xDS/Envoy 对接
-- 不描述 gRPC 数据转发
+运行计划包含以下内容：
 
-## 2. 总体架构
+- L7 HTTP 监听和路由表
+- L4 TCP 监听绑定
+- L4 UDP 监听绑定
+- 后端组和选择策略
+- 服务名到监听的索引
+- 本节点的轮询和时延状态
 
-FluxMesh 流量面采用“每节点本地运行时 + 控制面配置驱动”的模式。
+L7 服务可共享相同 TCP 监听。
+它们使用 Host 和 Path 匹配。
+每个 L4 监听只绑定一个同协议服务。
 
-- 配置来源：etcd 中 /mesh/services/ 前缀下的 ServiceConfig
-- 运行时进程：internal/traffic.Server
-- 规划编译器：internal/traffic.BuildPlan
-- 管理与诊断入口：internal/httpapi
+TCP 和 UDP 属于不同传输协议。
+它们可使用相同数字端口。
 
-关键特性：
+## 4. 配置收敛
 
-- 监听自动收敛：按 listener.addr + listener.port 合并复用监听（HTTP），并维护独立 TCP 绑定
-- Host + Path 匹配：同监听下多服务路由统一编排
-- 后端解析：支持 backend_groups、服务名回落、直连地址
-- 策略化选路：load-first、latency-first、round-robin、random
-- 失败恢复：重试尝试次数 + 预算比例 + 中继候选兜底
-- 低开销统计：原子计数 + 采样聚合
+启动时，流量面读取全部服务配置。
+初次编译失败会阻止应用启动。
 
-## 3. 组件分层
+启动后，etcd Watch 触发刷新。
+Watch 断开后，流量面等待 1 秒重连。
+每 30 秒还有一次兜底刷新。
 
-### 3.1 配置与模型层
+流量面用服务名和版本生成快照。
+快照未变化时，刷新直接返回。
+编译失败时，旧计划继续生效。
 
-- ServiceConfig 模型定义位于 internal/model/service.go
-- 服务配置存储位于 internal/registry/services.go
+新增监听失败时，运行时只写日志。
+配置版本变化后，运行时才会再次尝试。
 
-职责：
+## 5. L7 HTTP 链路
 
-- ApplyDefaults 填充最小可运行默认值
-- Validate 执行服务级字段合法性校验
-- Put/UpdateWithRevision 在写入 etcd 前强制 defaults + validate
+1. 请求进入 L7 监听。
+2. 计划按 Host 和 Path 匹配。
+3. 计划解析 `destination`。
+4. 策略生成上游候选。
+5. 运行时转发请求。
+6. 状态码不小于 502 时重试。
+7. 运行时更新本地统计。
 
-### 3.2 规划层（Plan）
+精确 Host 优先于通配 Host。
+长 Path 前缀优先于短前缀。
+相同条件下，路由权重决定顺序。
 
-- 入口：traffic.BuildPlan
-- 输出：Plan（监听视图、路由匹配结构、目标解析索引、策略状态）
+## 6. L4 TCP 链路
 
-职责：
+1. 连接进入 TCP 监听。
+2. 计划读取该监听的唯一绑定。
+3. 计划生成上游候选。
+4. 运行时依次尝试建立连接。
+5. 成功后双向复制字节流。
 
-- 将多个服务编译为按监听键合并的 HTTP 路由表
-- 生成 L4-TCP/L4-UDP 监听绑定（同协议同监听仅允许一个服务绑定）
-- 预构建 Host/Path 匹配结构（exact + wildcard）
-- 维护 backend group 到策略和 relay 目标索引
-- 检测监听冲突：同 addr+port 禁止混用 l7-http 与 l4-tcp（UDP 独立绑定）
+TCP 只在建连失败时换候选。
+已建立连接不会中途迁移。
 
-### 3.3 运行层（Runtime Server）
+## 7. L4 UDP 链路
 
-- 入口：traffic.Server.Start
-- 机制：Watch 事件驱动刷新，辅以低频轮询兜底（防 watch 中断）
+1. 报文进入 UDP 监听。
+2. 计划读取该监听的唯一绑定。
+3. 计划生成上游候选。
+4. 运行时写入上游并等待响应。
+5. 运行时把响应写回客户端。
 
-职责：
+会话键包含监听、客户端和上游。
+运行时按会话 TTL 复用 UDP 连接。
+每 5 秒清理一次过期会话。
 
-- 启停 HTTP/TCP/UDP 监听并保持与 Plan 一致
-- 处理 HTTP 请求匹配、目标解析、转发和重试
-- 处理 TCP 连接透传与上游重连尝试
-- 处理 UDP 报文透传与上游重试尝试
-- 执行 hop 限制与 relay 判断
-- 统计请求级与转发级指标
+## 8. 状态边界
 
-### 3.4 管理 API 层
+服务配置来自 etcd。
+流量计划保存在进程内存中。
+轮询计数和时延 EWMA 也在本地。
 
-- /api/v1/traffic/plan：查看编译后的监听与路由结果
-- /api/v1/traffic/match：对指定 addr/port/host/path 做匹配与解析
-- /api/v1/traffic/stats：查看运行时统计与平均时延
+SoftKV 当前不参与上游选择。
+不同节点可能选择不同上游。
+进程重启会清空选择状态。
 
-## 4. 数据流与控制流
+## 9. 管理接口边界
 
-### 4.1 配置下发流
+`/api/v1/traffic/plan` 只返回 L7 监听。
+该接口不返回 TCP 和 UDP 绑定。
 
-1. 运维通过 /api/v1/services 写入服务配置。
-2. registry.Services 将配置持久化到 /mesh/services/。
-3. traffic.Server 周期读取 services.List 并调用 BuildPlan。
-4. runtime 对比 desired listener 集合，增删监听并原子替换 Plan。
-5. 当服务快照（name + resource_version）未变化时，跳过 BuildPlan 与监听收敛。
+`/api/v1/traffic/match` 只模拟 L7 匹配。
+该接口不验证监听是否成功绑定。
 
-当前实现说明：
+`/api/v1/traffic/stats` 只统计 L7 请求。
+TCP 和 UDP 流量不进入该统计。
 
-- 优先通过 services.Watch 事件触发刷新。
-- 保留低频兜底轮询，确保 watch 中断后仍可最终收敛。
-- 刷新游标按最大 resource_version 递进，避免重复消费历史事件。
+## 10. 当前限制
 
-### 4.2 请求处理流
-
-HTTP 路径：
-
-1. 请求进入某个监听地址端口。
-2. 按 host + path 在当前 Plan 中匹配路由。
-3. 按 destination 解析目标：backend_group -> service listener -> host:port/http(s) URL。
-4. 根据 retry 和 budget 计算尝试次数，按策略生成候选。
-5. 逐个候选转发，成功则返回，失败按条件重试。
-6. 写入统计与 relay 相关指标。
-
-TCP 路径：
-
-1. 连接进入某个 TCP 监听地址端口。
-2. 按监听键获取唯一 TCP 绑定（service + destination）。
-3. 按 retry 规则生成上游候选并依次拨号。
-4. 建立连接后双向透传字节流（client <-> upstream）。
-
-UDP 路径：
-
-1. 报文进入某个 UDP 监听地址端口。
-2. 按监听键获取唯一 UDP 绑定（service + destination）。
-3. 按 retry 规则生成上游候选并依次尝试。
-4. 单次尝试内执行“写上游 + 读响应 + 回写客户端”。
-
-### 4.3 中继判定流
-
-- relay 目标来源于 backend target 的 tags.relay=true/1/yes/on。
-- 请求携带 X-FluxMesh-Hops，超过 max_hops 返回 508。
-- 转发时自动递增 hops 头部。
-
-## 5. 与控制面的边界
-
-强一致配置（etcd）：
-
-- 服务路由规则
-- 监听参数
-- 负载均衡策略选择
-- 重试与 relay 策略参数
-
-软状态（SoftKV）：
-
-- 当前流量面核心转发路径未直接消费 SoftKV 指标做动态打分。
-- latency-first 当前基于本地上游延迟 EWMA 做优先级排序（未引入跨节点全局指标）。
-
-## 6. 可用性与性能取向
-
-已落地的工程取向：
-
-- 单尝试主路径采用 direct transport fast-path，减少通用代理链路开销
-- 监听和目标对象缓存，避免重复构建
-- 服务快照差分，避免无配置变化时的重复 BuildPlan
-- Watch 事件驱动刷新，降低配置变更到生效的收敛延迟
-- 指标采样与异步聚合，降低请求路径写放大
-- 重试体缓存与复用，保证重试语义一致
-
-当前约束：
-
-- L4-TCP/L4-UDP 为基础透传模式，不支持基于 SNI/应用层特征路由
-- latency-first 当前为节点内局部时延感知，不是全局最优路径
-- relay 不做全局路径搜索，仅基于后端组候选顺序切换
-
-## 7. 演进建议
-
-- 接入 SoftKV 运行态指标，升级 latency-first 为跨节点指标驱动打分
-- 在 relay 场景引入更细粒度路径选择与惩罚策略
-- 增加分级可观测性（按服务/路由维度）并控制高基数标签
+- 没有 TLS 终止配置。
+- 没有 SNI 路由。
+- 没有连接级熔断。
+- 没有主动健康检查。
+- 没有请求体大小限制。
+- 重试不判断 HTTP 方法是否幂等。
+- Relay 只表示候选分类。
+- Relay 不执行全局路径搜索。

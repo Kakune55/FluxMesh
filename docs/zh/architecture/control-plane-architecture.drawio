@@ -474,10 +474,10 @@
         <mxCell id="R0k455zpAU4Ui9Bg6ccc-14" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="仅本地可见软状态" vertex="1">
           <mxGeometry height="54" width="188" x="654" y="502" as="geometry" />
         </mxCell>
-        <mxCell id="R0k455zpAU4Ui9Bg6ccc-15" parent="1" style="rhombus;strokeWidth=2;whiteSpace=wrap;" value="后续节点重启/配置修复?" vertex="1">
+        <mxCell id="R0k455zpAU4Ui9Bg6ccc-15" parent="1" style="rhombus;strokeWidth=2;whiteSpace=wrap;" value="进程是否重启?" vertex="1">
           <mxGeometry height="228" width="228" x="634" y="618" as="geometry" />
         </mxCell>
-        <mxCell id="R0k455zpAU4Ui9Bg6ccc-16" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="重新加入 memberlist" vertex="1">
+        <mxCell id="R0k455zpAU4Ui9Bg6ccc-16" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="重新启动 memberlist" vertex="1">
           <mxGeometry height="54" width="210" x="520" y="910" as="geometry" />
         </mxCell>
         <mxCell id="R0k455zpAU4Ui9Bg6ccc-17" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="恢复跨节点收敛" vertex="1">
@@ -489,7 +489,7 @@
         <mxCell id="R0k455zpAU4Ui9Bg6ccc-19" parent="1" style="rhombus;strokeWidth=2;whiteSpace=wrap;" value="消息是否丢失/乱序?" vertex="1">
           <mxGeometry height="196" width="196" x="1098" y="249" as="geometry" />
         </mxCell>
-        <mxCell id="R0k455zpAU4Ui9Bg6ccc-20" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Merge 规则处理&#xa;source_id + seq 优先" vertex="1">
+        <mxCell id="R0k455zpAU4Ui9Bg6ccc-20" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="Merge 比较来源、序号和时间" vertex="1">
           <mxGeometry height="78" width="208" x="999" y="490" as="geometry" />
         </mxCell>
         <mxCell id="R0k455zpAU4Ui9Bg6ccc-21" parent="1" style="whiteSpace=wrap;strokeWidth=2;" value="最终一致收敛" vertex="1">

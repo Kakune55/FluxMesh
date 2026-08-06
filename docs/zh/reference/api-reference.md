@@ -1,21 +1,35 @@
 # FluxMesh API 与配置参考
 
-本页是面向联调和排障的快速参考，不替代架构设计文档。若你想理解为什么这样设计，先看：
+管理接口默认监听 `:15000`。
+所有响应使用 JSON。
+当前接口不提供认证和授权。
 
-- [控制面白皮书](../architecture/control-plane-whitepaper.md)
-- [流量面架构](../architecture/traffic-plane-architecture.md)
-- [流量面详细设计](../design/traffic-plane-design.md)
-- [软状态KV与Gossip设计方案](../design/soft-kv-and-gossip.md)
+## 1. 通用行为
 
-## 1. 管理面 API 总览
+除 `/health` 外，不支持的方法返回 `405`。
+`/health` 当前不限制请求方法。
+参数或配置错误返回 `400`。
+资源不存在返回 `404`。
+版本冲突返回 `409`。
+上游目标解析失败返回 `502`。
 
-### 1.1 健康与诊断
+错误响应格式如下：
 
-#### GET /health
+```json
+{
+  "error": "error message"
+}
+```
 
-用途：进程存活和版本探针。
+当前错误消息没有稳定错误码。
+调用方应先判断 HTTP 状态码。
 
-响应示例：
+## 2. 健康与集群
+
+### 2.1 `GET /health`
+
+该接口只报告进程版本。
+它不检查 etcd 多数派和流量监听。
 
 ```json
 {
@@ -24,272 +38,351 @@
 }
 ```
 
-#### GET /api/v1/cluster/status
+### 2.2 `GET /api/v1/cluster/status`
 
-用途：查看 etcd 集群和 Raft 状态。
+该接口查询当前 etcd endpoint。
+响应字段如下：
 
-常见字段：
+| 字段 | 含义 |
+| --- | --- |
+| `endpoint` | 当前客户端使用的 endpoint |
+| `cluster_id` | etcd 集群 ID |
+| `current_member_id` | 响应节点的 member ID |
+| `leader_id` | 当前 leader ID |
+| `raft_term` | 当前任期 |
+| `raft_index` | 当前日志索引 |
+| `raft_applied_index` | 已应用日志索引 |
+| `db_size` | etcd 数据库字节数 |
+| `members` | 成员列表 |
 
-- endpoint
-- cluster_id
-- current_member_id
-- leader_id
-- raft_term
-- raft_index
-- raft_applied_index
-- db_size
-- members
+成员角色为 `leader`、`follower` 或 `learner`。
 
-### 1.2 节点接口
+## 3. 节点
 
-#### GET /api/v1/nodes
+### 3.1 `GET /api/v1/nodes`
 
-用途：返回当前节点视图，节点负载会从 SoftKV 的 metrics/nodes/ 前缀补充。
+该接口列出有效节点注册键。
+接口会补充 etcd 角色。
+接口还会聚合 SoftKV 节点指标。
 
-#### GET /api/v1/nodes/:id
+节点字段如下：
 
-用途：查询单个节点详情。
+| 字段 | 含义 |
+| --- | --- |
+| `id` | 节点 ID |
+| `ip` | 节点广播地址 |
+| `version` | 节点版本 |
+| `node_status.mesh_role` | `server` 或 `agent` |
+| `node_status.etcd_role` | etcd 角色 |
+| `node_status.node_status` | 当前固定为 `Ready` |
+| `sys_load` | 本节点看到的 SoftKV 指标 |
 
-#### DELETE /api/v1/nodes/:id
+### 3.2 `GET /api/v1/nodes/{id}`
 
-可选参数：
+该接口返回节点注册键的原始值。
+它不聚合 SoftKV 指标。
 
-- force=true：允许驱逐 leader
+节点不存在时返回 `404`。
 
-行为：
+### 3.3 `DELETE /api/v1/nodes/{id}`
 
-- Agent 节点：删除节点注册键
-- Server 节点：先删除节点注册键，再尝试 MemberRemove
-- Leader 且未传 force=true：返回 409
+查询参数：
 
-### 1.3 服务配置接口
+| 参数 | 必填 | 含义 |
+| --- | --- | --- |
+| `force` | 否 | 允许驱逐 leader |
 
-服务配置存储在 /mesh/services/，写入时会自动写入 `updated_at` 和 `updated_by`，读取时回填 `resource_version`。
+Agent 驱逐只删除节点注册键。
+Server 驱逐还会删除 etcd member。
+leader 未带 `force=true` 时返回 `409`。
 
-#### POST /api/v1/services
+控制面先删除注册键。
+之后才删除 etcd member。
+第二步失败时，第一步不会回滚。
 
-用途：创建或覆盖服务配置。
+驱逐不会停止目标进程。
+操作前应先停止该进程。
 
-请求头：
+响应示例：
 
-- Content-Type: application/json
-- X-Operator: 可选，操作者标识
+```json
+{
+  "node_id": "server-2",
+  "node_role": "server",
+  "node_deleted": true,
+  "member_id": 123,
+  "member_removed": true
+}
+```
 
-#### GET /api/v1/services
+## 4. 服务配置
 
-用途：列出所有服务配置。
+服务配置保存在 `/mesh/services/`。
+接口最多读取 1 MiB 请求体。
+当前实现不检查剩余内容。
 
-#### GET /api/v1/services/:name
+### 4.1 `POST /api/v1/services`
 
-用途：读取指定服务配置。
+POST 创建或覆盖同名配置。
+该接口不是“仅创建”操作。
 
-#### PUT /api/v1/services/:name?resource_version=<rev>
+可选请求头：
 
-用途：按 resource_version 做 CAS 更新。
+| 请求头 | 含义 |
+| --- | --- |
+| `Content-Type` | 使用 `application/json` |
+| `X-Operator` | 写入 `updated_by` |
 
-规则：
+成功时返回 `201`。
+响应包含补全后的请求配置。
+该响应不含有效资源版本。
+它也不含注册表写入的审计时间。
+写入后应使用 GET 读取完整资源。
 
-- URL 参数优先
-- 如果没有 URL 参数，则回退到请求体中的 resource_version
-- 仍然没有版本号时返回 400
+### 4.2 `GET /api/v1/services`
 
-冲突返回：
+该接口列出全部服务配置。
+每项包含当前 `resource_version`。
 
-- 409 Conflict
-- current_resource_version
-- current_config
+列表顺序由 etcd 键顺序决定。
+调用方不应依赖该顺序。
 
-#### DELETE /api/v1/services/:name
+### 4.3 `GET /api/v1/services/{name}`
 
-用途：删除指定服务配置。
+该接口读取一个服务配置。
+资源不存在时返回 `404`。
 
-## 2. 流量面 API 总览
+### 4.4 `PUT /api/v1/services/{name}`
 
-### 2.1 计划与匹配
+PUT 使用 CAS 更新。
+接口最多读取 1 MiB 请求体。
 
-#### GET /api/v1/traffic/plan
+版本号可来自以下位置：
 
-用途：查看当前服务配置编译后的监听计划。
+1. 查询参数 `resource_version`
+2. 请求体字段 `resource_version`
 
-返回：
+查询参数优先。
+版本号必须是正整数。
+路径名称必须与请求体名称一致。
+请求体名称也可以为空。
 
-- listeners
+冲突响应示例：
 
-每个 listener 包含：
+```json
+{
+  "error": "service resource version conflict",
+  "current_resource_version": 42,
+  "current_config": {}
+}
+```
 
-- listener.addr
-- listener.port
-- routes[]
+### 4.5 `DELETE /api/v1/services/{name}`
 
-每个 route 包含：
+DELETE 不检查资源版本。
+成功时返回：
 
-- service_name
-- hosts
-- path_prefix
-- destination
-- weight
+```json
+{
+  "status": "deleted",
+  "name": "payment-api"
+}
+```
 
-#### GET /api/v1/traffic/match?addr=&port=&host=&path=
+资源不存在时返回 `404`。
 
-用途：对指定监听上下文做路由模拟。
+## 5. 流量面
 
-必填参数：
+### 5.1 `GET /api/v1/traffic/plan`
 
-- port
-- host
+该接口重新读取并编译服务配置。
+它只返回 L7 HTTP 监听。
+它不返回 TCP 和 UDP 绑定。
 
-可选参数：
+响应格式如下：
 
-- addr：默认 0.0.0.0
-- path：默认 /
+```json
+{
+  "listeners": [
+    {
+      "listener": {
+        "addr": "0.0.0.0",
+        "port": 18080
+      },
+      "routes": []
+    }
+  ]
+}
+```
 
-成功返回字段：
+编译成功不表示端口已绑定。
+端口冲突只会出现在进程日志中。
 
-- listener
-- service_name
-- destination
-- resolved_destination
-- path_prefix
+### 5.2 `GET /api/v1/traffic/match`
 
-错误场景：
+该接口只模拟 L7 路由。
 
-- 400：端口非法或缺少 host
-- 404：没有命中路由
-- 502：destination 不能解析为可直连地址
+| 参数 | 必填 | 默认值 |
+| --- | --- | --- |
+| `addr` | 否 | `0.0.0.0` |
+| `port` | 是 | 无 |
+| `host` | 是 | 无 |
+| `path` | 否 | `/` |
 
-#### GET /api/v1/traffic/stats
+成功响应字段如下：
 
-用途：查看流量面轻量统计。
+- `listener`
+- `service_name`
+- `destination`
+- `resolved_destination`
+- `path_prefix`
 
-返回字段：
+未匹配路由时返回 `404`。
+目标不能解析时返回 `502`。
 
-- stats
-- avg_latency_ms
+该接口使用新建的选择状态。
+结果不代表下一个真实请求。
 
-stats 内部字段：
+### 5.3 `GET /api/v1/traffic/stats`
 
-- requests_total
-- success_total
-- error_total
-- retry_attempts_total
-- relay_hit_total
-- total_latency_ns
-- relay_latency_ns
+该接口返回当前节点的 L7 统计。
+TCP 和 UDP 不进入该统计。
 
-### 2.2 运行时行为摘要
-
-- HTTP/L7 监听按 addr + port 合并
-- L4/TCP 监听按 addr + port 单独绑定
-- 同一监听不允许混用 L7 和 L4
-- 路由优先级：精确 host 高于 *，长 path_prefix 高于短 path_prefix，weight 作为次级权重
-- destination 可解析为 backend group、服务名回落、或直连地址
-
-## 3. SoftKV API 总览
-
-### 3.1 原始视图
-
-#### GET /api/v1/softkv
-
-用途：查看软状态条目。
-
-可选参数：
-
-- prefix：按前缀过滤
-
-#### GET /api/v1/softkv/:key
-
-用途：按 key 精确查询软状态。
-
-说明：key 需要做 URL 编码。
-
-#### GET /api/v1/softkv/stats
-
-用途：查看 SoftKV 存储统计。
-
-## 4. 服务配置模型速查
-
-### 4.1 顶层字段
-
-- name：必填
-- namespace：可选
-- version：可选
-- routes：必填，至少 1 条
-- backend_groups：可选
-- traffic_policy：必填，至少包含 listener
-
-### 4.2 traffic_policy 常用字段
-
-- proxy.layer：l7-http、l4-tcp 或 l4-udp，默认 l7-http
-- protocols：l7-http 只能是 http，l4-tcp 只能是 tcp，l4-udp 只能是 udp
-- listener.addr：默认 0.0.0.0
-- listener.port：1 到 65535
-- lb.strategy：load-first、round-robin、random、latency-first，或自定义 [a-z0-9-]
-- retry.max_attempts：默认 1
-- retry.budget_ratio：默认 1
-- relay.max_hops：默认 2
-- observability.metrics_sample_rate：默认 1，范围 1 到 10000
-- udp.dial_timeout_ms：默认 2000，范围 1 到 60000
-- udp.read_timeout_ms：默认 2000，范围 1 到 60000
-- udp.write_timeout_ms：默认 2000，范围 1 到 60000
-- udp.session_ttl_ms：默认 30000，范围 100 到 3600000
-- udp.max_packet_size：默认 65535，范围 512 到 65535
-
-### 4.3 路由和后端组约束
-
-- routes[].hosts 为空时默认补为 [*]
-- routes[].weight 为空时默认 100
-- backend_groups[].targets[].weight 为空时默认 100
-- backend_groups 名称在全局 Plan 中必须唯一
-- backend target.addr 必须是 host:port
-
-## 5. 启动参数速查
-
-### 5.1 基本参数
-
-- --role：server 或 agent
-- --cluster-state：new 或 existing，仅 server 需要
-- --node-id：节点唯一 ID
-- --ip：auto 或具体 IPv4
-- --version：版本号
-- --data-dir：embedded etcd 数据目录
-- --admin-addr：管理面地址，默认 :15000
-- --seed-endpoints：逗号分隔的 etcd 地址列表
-- --lease-ttl：节点租约 TTL 秒数，默认 10
-
-### 5.2 默认值说明
-
-- role 默认 agent
-- cluster-state 默认 new
-- ip 默认 auto
-- version 默认 v0.1.0
-- data-dir 默认 ./data
-- admin-addr 默认 :15000
-- client-listen-url 默认 http://0.0.0.0:2379
-- peer-listen-url 默认 http://0.0.0.0:2380
-- lease-ttl 默认 10
-
-### 5.3 环境变量
-
-对应的环境变量前缀为 FLUXMESH_，例如：
-
-- FLUXMESH_ROLE
-- FLUXMESH_CLUSTER_STATE
-- FLUXMESH_NODE_ID
-- FLUXMESH_IP
-- FLUXMESH_VERSION
-- FLUXMESH_DATA_DIR
-- FLUXMESH_ADMIN_ADDR
-- FLUXMESH_CLIENT_LISTEN_URL
-- FLUXMESH_CLIENT_ADVERTISE_URL
-- FLUXMESH_PEER_LISTEN_URL
-- FLUXMESH_PEER_ADVERTISE_URL
-- FLUXMESH_SEED_ENDPOINTS
-- FLUXMESH_LEASE_TTL
-
-## 6. 推荐排障顺序
-
-1. 先看 /health
-2. 再看 /api/v1/cluster/status
-3. 再看 /api/v1/nodes
-4. 再看 /api/v1/services 和 /api/v1/traffic/plan
-5. 最后看 /api/v1/softkv/stats
+```json
+{
+  "stats": {
+    "requests_total": 10,
+    "success_total": 9,
+    "error_total": 1,
+    "retry_attempts_total": 2,
+    "relay_hit_total": 0,
+    "total_latency_ns": 1000000,
+    "relay_latency_ns": 0
+  },
+  "avg_latency_ms": 0.1
+}
+```
+
+`success_total` 包含 4xx 响应。
+采样率大于 1 时，计数是估算值。
+
+## 6. SoftKV
+
+SoftKV 接口返回当前节点的本地视图。
+这些接口不聚合集群全部节点。
+
+### 6.1 `GET /api/v1/softkv`
+
+可选参数 `prefix` 按键前缀过滤。
+响应按键升序排列。
+过期条目不会返回。
+
+### 6.2 `GET /api/v1/softkv/{key}`
+
+该接口精确查询一个键。
+路径中的斜杠必须编码。
+键不存在或过期时返回 `404`。
+
+### 6.3 `GET /api/v1/softkv/stats`
+
+该接口返回本地 Store 计数。
+字段说明见 [SoftKV 设计](../design/soft-kv-and-gossip.md)。
+
+## 7. 服务配置字段
+
+### 7.1 顶层字段
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `name` | 是 | 服务名 |
+| `namespace` | 否 | 业务命名空间 |
+| `version` | 否 | 业务版本 |
+| `resource_version` | PUT 时必填 | etcd 修改版本 |
+| `routes` | 是 | 至少一项 |
+| `backend_groups` | 否 | 后端组 |
+| `traffic_policy` | 是 | 至少声明监听端口 |
+
+### 7.2 路由
+
+| 字段 | 默认值 | 约束 |
+| --- | --- | --- |
+| `hosts` | `["*"]` | 元素不能为空 |
+| `path_prefix` | 无 | 必须以 `/` 开始 |
+| `destination` | 无 | 必填 |
+| `weight` | `100` | 1 到 100 |
+
+L4 TCP 和 UDP 只使用第一条路由。
+
+### 7.3 后端组
+
+| 字段 | 约束 |
+| --- | --- |
+| `backend_groups[].name` | 计划内全局唯一 |
+| `targets` | 至少一项 |
+| `targets[].addr` | `host:port` |
+| `targets[].weight` | 默认 100，范围 1 到 100 |
+| `targets[].tags.relay` | 标记 Relay 候选 |
+
+### 7.4 流量策略
+
+| 字段 | 默认值 | 范围或取值 |
+| --- | --- | --- |
+| `proxy.layer` | `l7-http` | `l7-http`、`l4-tcp`、`l4-udp` |
+| `protocols` | 按代理层 | `http`、`tcp` 或 `udp` |
+| `listener.addr` | `0.0.0.0` | IPv4 |
+| `listener.port` | 无 | 1 到 65535 |
+| `lb.strategy` | `load-first` | 内置值或已注册名称 |
+| `retry.max_attempts` | 运行时为 1 | 整数 |
+| `retry.budget_ratio` | 零值 | 浮点数 |
+| `relay.max_hops` | 运行时为 2 | 整数，仅 L7 |
+| `observability.metrics_sample_rate` | `1` | 1 到 10000 |
+| `udp.dial_timeout_ms` | `2000` | 1 到 60000 |
+| `udp.read_timeout_ms` | `2000` | 1 到 60000 |
+| `udp.write_timeout_ms` | `2000` | 1 到 60000 |
+| `udp.session_ttl_ms` | `30000` | 100 到 3600000 |
+| `udp.max_packet_size` | `65535` | 512 到 65535 |
+
+## 8. 启动参数
+
+命令行参数覆盖对应环境变量。
+空环境变量按未设置处理。
+
+| 参数 | 环境变量 | 默认值 |
+| --- | --- | --- |
+| `--role` | `FLUXMESH_ROLE` | `agent` |
+| `--cluster-state` | `FLUXMESH_CLUSTER_STATE` | `new` |
+| `--node-id` | `FLUXMESH_NODE_ID` | 无 |
+| `--ip` | `FLUXMESH_IP` | `auto` |
+| `--version` | `FLUXMESH_VERSION` | `v0.1.0` |
+| `--data-dir` | `FLUXMESH_DATA_DIR` | `./data` |
+| `--admin-addr` | `FLUXMESH_ADMIN_ADDR` | `:15000` |
+| `--client-listen-url` | `FLUXMESH_CLIENT_LISTEN_URL` | `http://0.0.0.0:2379` |
+| `--client-advertise-url` | `FLUXMESH_CLIENT_ADVERTISE_URL` | 自动推导 |
+| `--peer-listen-url` | `FLUXMESH_PEER_LISTEN_URL` | `http://0.0.0.0:2380` |
+| `--peer-advertise-url` | `FLUXMESH_PEER_ADVERTISE_URL` | 自动推导 |
+| `--seed-endpoints` | `FLUXMESH_SEED_ENDPOINTS` | 无 |
+| `--lease-ttl` | `FLUXMESH_LEASE_TTL` | `10` |
+
+`node-id` 始终必填。
+Agent 必须配置种子地址。
+existing Server 也必须配置种子地址。
+租约 TTL 必须大于零。
+
+`ip=auto` 只查找非回环 IPv4。
+找不到地址时，应用启动失败。
+
+整数环境变量格式错误时，配置使用默认值。
+当前实现不会报告该格式错误。
+
+## 9. 默认端口
+
+| 端口 | 用途 |
+| --- | --- |
+| `15000/tcp` | 管理接口 |
+| `2379/tcp` | etcd client |
+| `2380/tcp` | etcd peer |
+| `7946/tcp` | memberlist |
+| `7946/udp` | memberlist |
+
+只有 Server 监听 etcd 端口。
+所有节点默认监听 Gossip 端口。

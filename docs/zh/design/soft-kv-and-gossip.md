@@ -1,156 +1,185 @@
-# FluxMesh SoftKV 架构白皮书（最终版）
+# FluxMesh SoftKV 设计
 
-版本：v1.0（2026-03-14）
+## 1. 范围
 
-## 1. 摘要
+SoftKV 保存可丢失的短期状态。
+当前调用方只写入节点系统指标。
 
-SoftKV 是 FluxMesh 控制面的软状态平面，用于承载高频、可丢、最终一致的数据（当前以节点监控指标为主）。
+SoftKV 不保存服务配置。
+SoftKV 也不管理节点成员关系。
+这些数据仍由 etcd 保存。
 
-最终方案采用：
+## 2. 组件
 
-- 本地内存 KV（TTL + 合并规则）
-- memberlist Gossip 增量扩散
-- 管理面 API 聚合输出
-- 强一致/弱一致分层边界
+| 组件 | 代码位置 | 职责 |
+| --- | --- | --- |
+| Store | `internal/softkv/store.go` | 保存、读取、合并和过期条目 |
+| Bus | `internal/softkv/bus.go` | 传递本地写入事件 |
+| Writer | `internal/softkv/writer.go` | 组合本地写入和事件发布 |
+| Memberlist | `internal/softkv/memberlist.go` | 扩散事件和交换完整状态 |
+| GC | `internal/app/app.go` | 定时删除过期条目 |
 
-其中 etcd 继续承载强一致控制数据，SoftKV 不替代 etcd。
+Store 和 Bus 都在进程内存中。
+进程退出后，数据和计数全部丢失。
 
-## 2. 设计目标
+## 3. 条目模型
 
-- 降低 etcd 写压：不再把高频 sys_load 周期回写到 etcd。
-- 保持可观测性：`/api/v1/nodes` 仍可返回完整节点视图。
-- 保持简洁实现：接口薄、链路短、失败可退化。
-- 最终一致：允许短暂差异，不追求线性一致。
+```json
+{
+  "key": "metrics/nodes/server-1",
+  "value": {},
+  "source_id": "server-1",
+  "seq": 12,
+  "updated_at": 1786000000000,
+  "expires_at": 1786000030000,
+  "ingested_at": 1786000000100
+}
+```
 
-## 3. 设计边界
+| 字段 | 含义 |
+| --- | --- |
+| `key` | 逻辑键 |
+| `value` | 任意 JSON 值 |
+| `source_id` | 写入节点 |
+| `seq` | 来源节点的进程内序号 |
+| `updated_at` | 来源节点写入时间 |
+| `expires_at` | 来源节点计算的过期时间 |
+| `ingested_at` | 当前节点接收时间 |
 
-适用：
+时间字段使用 Unix 毫秒。
+序号按 `source_id` 分别递增。
 
-- 节点 CPU/内存/load 等高频监控快照
-- 临时统计或可覆盖状态
+## 4. 本地写入
 
-不适用：
+Writer 先调用 Store Put。
+Put 成功后，本地读取立即可见。
+Writer 随后向 Bus 发布事件。
 
-- 服务配置与路由策略
-- 节点成员治理与角色变更
-- 需要审计和强一致保障的数据
+Bus 默认缓冲区为 256。
+发布默认最多等待 200 毫秒。
+当前 Bus 在缓冲区满时立即返回错误。
 
-边界原则：
+发布失败不回滚本地写入。
+Writer 在结果中返回 `PublishErr`。
+应用只记录该错误。
 
-- 强一致控制数据 -> etcd
-- 高频软状态数据 -> SoftKV
+## 5. 节点指标
 
-## 4. 组件与职责
+应用每 10 秒获取一次系统指标。
+首次采样发生在首个周期之后。
+指标保留两位小数。
 
-### 4.1 Store
+指标键格式如下：
 
-`internal/softkv/store.go`
+```text
+metrics/nodes/{node-id}
+```
 
-- 负责本地 KV 存储
-- `Put/Get/List/Merge/DeleteExpired`
-- 支持 TTL 与过期回收
+指标 TTL 为 30 秒。
+GC 每 1 秒扫描一次过期条目。
+Get 和 List 也会隐藏过期条目。
 
-### 4.2 Bus
+`GET /api/v1/nodes` 聚合节点指标。
+节点基础信息仍来自 etcd。
 
-`internal/softkv/bus.go`
+## 6. Gossip 启动
 
-- 负责事件通道抽象（发布/订阅）
-- 与存储解耦，便于测试与替换
+每个节点启动一个 memberlist 实例。
+默认绑定 `0.0.0.0:7946`。
+广播地址使用节点 IP。
 
-### 4.3 Writer（写入封装）
+应用在启动时读取一次节点列表。
+应用使用已有节点作为 Join 目标。
+当前实现不会刷新该目标列表。
 
-`internal/softkv/writer.go`
+Join 失败不终止 memberlist。
+节点先以单节点模式运行。
+它按 5 至 60 秒退避重试 Join。
 
-- 一次调用完成 `Put + Publish`
-- 保留“写入成功但广播失败”的可观测语义
-- 业务侧调用更简洁
+memberlist 创建失败时，应用切换到 Loopback。
+Loopback 只消费本地 Bus 事件。
+该模式不会自动恢复 Gossip。
+恢复需要重启进程。
 
-### 4.4 Memberlist 传输层
+## 7. 扩散和状态交换
 
-`internal/softkv/memberlist.go`
+本地 Put 事件进入广播队列。
+队列按 memberlist 规则重复发送。
+远端节点收到消息后调用 Merge。
 
-- Gossip 广播增量事件
-- 接收远端事件并合并到本地 Store
-- 广播不可用时支持降级回环（loopback）
+memberlist 还支持完整状态交换。
+本节点通过 `LocalState` 导出有效条目。
+接收节点通过 `MergeRemoteState` 合并条目。
 
-## 5. 数据模型
+该交换发生在 memberlist Push/Pull 流程。
+SoftKV 没有独立的定时反熵任务。
 
-SoftKV 条目核心字段：
+## 8. 合并规则
 
-- `key`: 逻辑键（例如 `metrics/nodes/server-1`）
-- `value`: 任意值（当前为指标快照）
-- `source_id`: 来源节点
-- `seq`: 单来源递增版本
-- `updated_at`: 更新时间（毫秒）
-- `expires_at`: 过期时间（毫秒）
+Merge 先拒绝空键和过期条目。
+之后按以下顺序比较：
 
-## 6. 一致性与合并规则
+1. 来源相同时，较大序号优先。
+2. 更新时间不同，较新时间优先。
+3. 来源不同，较大来源 ID 优先。
+4. 其他情况使用较大序号。
 
-- 同 `source_id` 下，`seq` 更大者覆盖。
-- 无序到达或重复消息通过 `Merge` 自然收敛。
-- 以最终一致为目标，不保证严格时序。
+来源节点重启后，序号从零开始。
+新时间通常允许新条目覆盖旧条目。
+该规则依赖节点时钟大致同步。
 
-## 7. 端到端工作流
+条目的过期时间来自来源节点。
+时钟偏差会影响接收节点的 TTL。
 
-### 7.1 写入链路（当前主路径）
+## 9. 查询接口
 
-1. 采集器在本地周期生成指标快照。
-2. App 调用 `Writer.Write(...)` 写入 `metrics/nodes/{nodeID}`。
-3. `Writer` 内部 `Put` 成功后尝试 `Publish`。
-4. 本地节点可立即读到新值。
+`GET /api/v1/softkv` 返回有效条目。
+`prefix` 参数执行字符串前缀过滤。
 
-### 7.2 扩散链路
+`GET /api/v1/softkv/{key}` 精确查询。
+路径中的斜杠必须做 URL 编码。
 
-1. 事件进入 memberlist 广播队列。
-2. 其他节点收到消息后调用 `Store.Merge`。
-3. 各节点逐步收敛到相近视图。
+`GET /api/v1/softkv/stats` 返回本地计数。
+这些计数不是集群聚合结果。
 
-### 7.3 读取链路
+## 10. 统计字段
 
-- `GET /api/v1/softkv`：原始软状态视图。
-- `GET /api/v1/nodes`：
-    - 基础节点信息来自 etcd。
-    - `sys_load` 由 SoftKV 聚合填充。
+| 字段 | 含义 |
+| --- | --- |
+| `put_total` | 本地 Put 次数 |
+| `put_errors` | 本地 Put 错误数 |
+| `get_total` | Get 次数 |
+| `get_hits` | Get 命中数 |
+| `get_misses` | Get 未命中数 |
+| `list_total` | List 次数 |
+| `merge_total` | Merge 次数 |
+| `merge_accepted` | 接受的远端条目数 |
+| `merge_rejected` | 拒绝的远端条目数 |
+| `delete_expired_runs` | GC 扫描次数 |
+| `delete_expired_keys` | GC 删除数 |
+| `live_entries` | Store 内条目数 |
+| `sources` | 已见来源数 |
 
-## 8. 故障与退化策略
+`live_entries` 包含尚未由 GC 删除的条目。
+它可能短暂包含已过期条目。
 
-- Gossip 启动失败：回退 loopback，单节点仍可用。
-- Publish 失败：不影响本地写入成功，错误可观测。
-- 节点重启：软状态可丢，后续采样会重新覆盖。
+## 11. 故障语义
 
-## 9. 当前实现状态
+- 本地 Put 失败时，不发布事件。
+- Bus 满时，本地值仍有效。
+- Gossip 丢包时，节点可能短暂不同。
+- 节点重启后，软状态全部丢失。
+- 网络分区恢复后，memberlist 可交换状态。
+- Loopback 降级后，不会自动恢复跨节点扩散。
 
-已完成：
+SoftKV 只提供最终一致视图。
+调用方不能依赖线性读取。
 
-- SoftKV Store（TTL + Merge + GC）
-- Bus 抽象与 Writer 薄封装
-- memberlist 广播接入
-- `/api/v1/softkv` 查询接口
-- `/api/v1/nodes` 的 `sys_load` 迁移到 SoftKV
-- 关键单测与集成验证
+## 12. 安全边界
 
-未完成（下一阶段）：
+Gossip 当前没有加密和认证。
+任意可访问端口的节点可能加入。
+部署环境必须隔离 7946 端口。
 
-- 反熵同步（Anti-Entropy，可选项）
-- 更细粒度流控与限速
-
-反熵策略结论：
-
-- 对当前“高频可覆盖监控快照”场景，反熵不是绝对必要条件。
-- 优先基于可观测指标评估（收敛延迟、丢失趋势、跨节点差异）后再决定是否启用。
-- 当出现长时间分区、低频但重要软状态、或收敛指标持续超阈值时，再引入反熵机制。
-
-## 10. 运维建议
-
-- 使用三节点及以上部署 Gossip，避免单点视角偏差。
-- 优先观察 `metrics/nodes/` 前缀键的更新与过期行为。
-- 把 SoftKV 视为“实时快照层”，不要用于审计回溯。
-
-## 11. 结论
-
-SoftKV 最终版架构已形成稳定分层：
-
-- etcd 负责“控制正确性”
-- SoftKV 负责“状态实时性”
-
-该分层在保持控制面一致性的同时，显著降低了高频监控数据对强一致存储的压力，并为后续反熵与更大规模扩展留出了演进空间。
+SoftKV 值使用 JSON 编码扩散。
+调用方不应写入凭据或密钥。

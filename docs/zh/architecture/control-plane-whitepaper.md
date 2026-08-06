@@ -1,177 +1,80 @@
-# FluxMesh 控制面设计白皮书
+# FluxMesh 控制面取舍
 
-## 1. 摘要
+本文解释控制面的主要取舍。
+实现细节见[控制面设计](control-plane-design.md)。
 
-FluxMesh 控制面是一个面向中小规模分布式场景的轻量级 Service Mesh 控制平面实现。
+## 1. 同一二进制承载两种角色
 
-其核心目标是在不依赖外部独立存储集群的前提下，提供：
+FluxMesh 不拆分 Server 和 Agent 二进制。
+该设计减少构建和分发类型。
+启动参数仍明确区分节点职责。
 
-- 可自举的控制面集群
-- 节点自动注册与失联自动收敛
-- 集群选举状态可观测
-- 声明式服务配置管理
-- 并发写入冲突保护（CAS）
+同一二进制不表示角色可自动切换。
+当前进程不会把 Agent 提升为 Server。
+修改角色后必须重启进程。
 
-项目采用同构二进制架构：所有节点运行同一程序，通过配置推导角色（server/agent）。
+## 2. Server 内嵌 etcd
 
-## 2. 背景与问题
+Server 不依赖独立 etcd 部署。
+这适合小型集群和边缘环境。
+代价是应用进程承担存储生命周期。
 
-传统控制面通常依赖独立部署的 etcd 或 Kubernetes，带来较高的部署与运维门槛。在实验环境、边缘场景或资源受限环境中，快速搭建与低复杂度治理能力更重要。
+etcd 数据目录必须持久保存。
+Server 升级也必须考虑 etcd 兼容性。
+资源限制必须覆盖业务和 etcd 开销。
 
-FluxMesh 的设计取舍是：
+## 3. Raft 成员与节点注册分层
 
-- 在 MVP 阶段优先保证状态一致性与可观测
-- 将复杂流量治理能力延后
-- 先建立稳定的控制面状态机和接口契约
+etcd member 决定 Raft 拓扑。
+节点注册键表示进程存活视图。
+两者不能合并为一种状态。
 
-## 3. 设计目标与非目标
+member 变更必须显式执行。
+节点注册键使用租约自动过期。
+该分层避免租约误改 Raft 拓扑。
 
-### 3.1 设计目标
+## 4. 强状态与软状态分层
 
-- 零外部依赖：server 内嵌 etcd，可单机或小集群自举。
-- 状态机解耦：Raft 成员一致性与业务节点租约生命周期分层处理。
-- 自动扩容：server 通过 MemberAdd 实现半自动加入。
-- 失效收敛：租约到期自动清理节点注册信息。
-- 高可观测：暴露健康、拓扑、选举、配置等管理接口。
+服务配置影响流量转发。
+控制面把该配置保存到 etcd。
+节点指标更新频繁且允许丢失。
+应用把节点指标保存到 SoftKV。
 
-### 3.2 非目标（当前阶段）
+该设计减少 etcd 高频写入。
+代价是各节点指标可能短暂不同。
+调用方不能使用 SoftKV 做配置决策。
 
-- 不实现数据面劫持（iptables/eBPF）。
-- 不实现 xDS 下发与 Envoy 集成。
-- 不覆盖复杂流量策略编排（灰度、多维匹配、熔断链路）。
+## 5. CAS 保护配置更新
 
-## 4. 架构总览
+POST 保留覆盖写语义。
+PUT 提供带版本的更新语义。
+调用方需要先读取当前版本。
 
-系统角色：
+CAS 防止静默覆盖并发修改。
+它不提供审批和历史回滚。
+当前版本也不保存变更记录。
 
-- Server：启动内嵌 etcd，参与选举与成员管理。
-- Agent：仅作为 etcd client 接入，进行注册保活与状态上报。
+## 6. 可用性取舍
 
-关键存储命名空间：
+单 Server 部署最省资源。
+该部署不能容忍 Server 故障。
 
-- /mesh/nodes/: 节点注册与状态信息（绑定租约）
-- /mesh/services/: 服务配置（持久键，不绑定租约）
+两个 Server 仍需要两个投票。
+任一 Server 故障都会停止写入。
+因此双节点部署使用 1S1A。
 
-## 5. 核心机制
+三个 Server 可容忍一个故障。
+五个 Server 可容忍两个故障。
+更多 Server 也会增加复制开销。
 
-### 5.1 启动与角色路由
+## 7. 当前非目标
 
-- role=agent：直接连接 seed endpoints。
-- role=server + cluster-state=new：作为创始节点启动。
-- role=server + cluster-state=existing：先 MemberAdd，再以返回拓扑启动。
+- 自动角色提升
+- 自动替换失效 member
+- 管理接口认证和授权
+- 服务配置历史版本
+- xDS 和 Envoy 集成
+- iptables 或 eBPF 流量劫持
+- 跨节点全局负载最优解
 
-### 5.2 Server Auto-Join 与失败回滚
-
-流程：
-
-1. 新 server 先以 client 身份连接现有集群。
-2. 调用 MemberAdd 预注册 peer URL。
-3. 拉取成员列表并生成 initial-cluster。
-4. 启动本地 embedded etcd。
-
-失败处理：
-
-- 启动失败立即 MemberRemove 回滚。
-- 回滚失败进入后台重试队列，直到清理成功。
-
-### 5.3 租约保活与拓扑收敛
-
-- 节点注册键绑定 lease。
-- KeepAlive 续租。
-- 进程异常或网络中断导致续租失败时，TTL 到期后键自动删除。
-
-### 5.4 服务配置 CAS（并发保护）
-
-更新接口采用 resource_version（etcd mod revision）做乐观并发控制：
-
-- 客户端先 GET 获取 resource_version。
-- PUT 时携带 resource_version。
-- 仅当当前 revision 匹配时提交成功。
-- 冲突返回 409，包含 current_resource_version 与 current_config。
-
-## 6. API 设计
-
-### 6.1 诊断接口
-
-- GET /health
-- GET /api/v1/cluster/status
-
-### 6.2 节点接口
-
-- GET /api/v1/nodes
-- GET /api/v1/nodes/:id
-- DELETE /api/v1/nodes/:id
-  - 可选参数：force=true
-  - leader 默认禁止驱逐（返回 409）
-
-### 6.3 服务接口
-
-- POST /api/v1/services
-- GET /api/v1/services
-- GET /api/v1/services/:name
-- PUT /api/v1/services/:name?resource_version=<rev>
-- DELETE /api/v1/services/:name
-
-审计字段：
-
-- updated_by：优先取请求头 X-Operator
-- updated_at：服务端写入 UTC 时间戳
-
-## 7. 一致性与可用性策略
-
-### 7.1 Quorum 策略
-
-遵循 Raft 多数派写原则，建议：
-
-- 2 节点：1 server + 1 agent
-- 3 节点及以上：奇数 server（3/5）
-
-### 7.2 关键故障场景
-
-- Agent 失联：租约到期自动移出拓扑。
-- Server 崩溃：保留多数派时继续服务，失去多数派时拒绝写。
-- Server 加入失败：MemberRemove 主动回滚，后台重试兜底。
-- Leader 误驱逐：默认拒绝，需 force 显式确认。
-
-## 8. 安全与治理约束
-
-当前版本默认聚焦功能闭环，接口侧尚未引入完整鉴权链路。建议在下一阶段补充：
-
-- 管理接口认证（Token/mTLS）
-- 操作审计落盘
-- 配置变更审批或准入策略
-
-## 9. 当前实现状态
-
-已完成：
-
-- 控制面自举与 Auto-Join
-- 节点注册保活与失效收敛
-- Cluster Status 诊断接口
-- 节点查询与驱逐（含 leader 保护）
-- 服务配置 CRUD（含 CAS 更新）
-- 基础审计字段（updated_by/updated_at）
-- 关键路径测试（httpapi、registry）
-
-待完成：
-
-- 服务配置历史版本回溯
-- 统一错误码与响应体规范
-- 管理接口认证与授权
-- 更完整的故障注入与恢复测试矩阵
-
-已纳入稳定方案：
-
-- 软状态 KV 与 Gossip 架构（见 软状态KV与Gossip设计方案.md）
-
-## 10. 运维与联调建议
-
-- 日常联调优先使用 [快速开始](../getting-started.md) 的 API 清单。
-- 处理 409 冲突时，优先采用返回的 current_resource_version/current_config 重试。
-- 生产化前必须补齐认证和操作审计持久化。
-
-## 11. 结论
-
-FluxMesh 控制面在当前阶段已完成从“可启动”到“可治理、可观测、可并发安全更新”的跨越。通过内嵌 etcd 与清晰的状态机边界，项目在复杂度、可维护性和可扩展性之间取得了较好的平衡。
-
-下一阶段应重点投入在安全治理与历史审计能力，以支撑更高可信度的生产实践。
+这些项目不是当前实现能力。

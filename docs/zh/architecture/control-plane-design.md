@@ -1,308 +1,201 @@
-## 1. 概述与设计目标
+# FluxMesh 控制面设计
 
-本设计文档针对分布式 Service Mesh 系统的控制平面（Control Plane）部分，提出并设计了一个轻量级、去中心化、具备高度自治能力的状态管理骨架。传统 Service Mesh（如 Istio）控制平面通常重度依赖独立的外部存储（如单独部署的 etcd/Kubernetes 集群），导致部署运维成本极高。
+## 1. 范围
 
-本设计的**核心创新点**在于：采用**同构二进制架构（Homogeneous Binary Architecture）** ，所有节点运行完全相同的程序，通过配置文件动态推导身份（Server 或 Agent）。Server 节点内嵌 etcd 实例，实现了“零外部依赖”的控制面网络自组建。
+控制面管理三类强一致状态：
 
-### 1.1 设计目标
+- etcd member 元数据
+- 节点注册键
+- 服务配置
 
-*. **零外部依赖 (Zero External Dependencies)** ：核心状态存储通过 go.etcd.io/etcd/server/v3/embed 嵌入到业务进程中，开箱即用。
-*. **状态机解耦 (State Machine Decoupling)** ：将底层的“集群拓扑共识（Raft）”与上层的“节点存活状态（Lease KeepAlive）”解耦。
-*. **零干预热扩容 (Zero-touch Scaling)** ：基于 etcd Member API 设计“预协商自动加入（Auto-join）”机制，避免繁琐的手动集群配置。
-*. **高可观测性 (High Observability)** ：内置 HTTP 接口实时暴露 Mesh 拓扑网络，便于状态可视化验证。
+节点指标属于 SoftKV。
+流量转发属于流量面。
 
-### 1.2 MVP 边界声明 (Scope Limitation)
+## 2. 节点角色
 
-本期 MVP（最小可行性产品）聚焦于**控制面底层状态机机制的探索、分布式共识的建立与节点发现**。数据面（Data Plane）的流量劫持（如 iptables/eBPF）与 Envoy xDS 协议的集成属于 Future Work。
+### 2.1 Server
 
----
+Server 启动内嵌 etcd。
+Server 参与 Raft 选举。
+Server 可创建新集群。
+Server 也可加入现有集群。
 
-## 2. 理论基础与设计哲学
+### 2.2 Agent
 
-### 2.1 基于 CAP 定理的 Quorum 降级策略
+Agent 不启动 etcd。
+Agent 连接 `seed-endpoints`。
+Agent 仍注册节点信息。
+Agent 也运行管理接口和流量面。
 
-根据 Raft 共识算法，集群需要
+## 3. etcd 启动
 
-`N/2+1`
+### 3.1 新集群
 
- 个节点才能达成多数派（Quorum）共识。
+`cluster-state=new` 用于首个 Server。
+应用使用节点 ID 作为 member 名称。
+应用使用 peer 广播地址构造初始集群。
 
-- 当系统只有 2 个节点时，若以 2 个 Server 运行，一旦 1 台宕机，剩余 1 台无法满足 Quorum，将导致整个控制平面不可写（防脑裂机制）。
-- **本系统设计策略**：对于 2 节点规模，强制降级为 1 Server + 1 Agent 模式。只有当节点规模 `≥3`
+数据目录为：
 
-  时，才推荐启用 3 Server 模式。此设计严谨遵循了分布式系统的高可用性（HA）数学模型。
-
-### 2.2 同构去中心化网络
-
-借鉴边缘计算（Edge Computing）和轻量级集群（如 K3s）的理念，消除单点故障（SPOF）。所有节点均具备成为控制节点的潜力，极大地降低了异构环境下的软件分发与版本对齐成本。
-
----
-
-## 3. 核心架构与角色划分
-
-系统由单一的 Mesh-Agent 进程构成，通过启动参数 role 划分为两种逻辑角色：
-
-*. **Server 角色（控制节点/投票节点）**
-
-- **行为**：启动内嵌的 etcd server，参与 Raft 选举与日志复制。
-- **职责**：维护全局强一致性状态，处理 Agent 的读写请求。推荐奇数个（3、5 个）部署。
-  *. **Agent 角色（工作节点/只读节点）**
-- **行为**：不启动本地 etcd server，仅作为单纯的 etcd Client 运行。
-- **职责**：连接到 Server 节点构成的集群，定期上报自身健康状态，并 Watch 订阅全局配置。
-
-### 3.1 数据模型定义
-
-系统状态存储在 etcd 的 /mesh/nodes/ 键前缀下。每个节点以自己的 ID 为后缀生成独立的 Key，Value 为结构化的 JSON 数据：
-
-```json
-// Key: /mesh/nodes/node-osaka-01
-{
-    "id": "node-osaka-01",
-    "ip": "192.168.1.10",
-	"version": "1.0.0",
-    "role": "server",
-    "status": "Ready",
-    "load": 45  // 暂时占位保留
-}
+```text
+{data-dir}/{node-id}
 ```
 
----
+### 3.2 加入现有集群
 
-## 4. 系统启动与状态流转流（核心机制）
+`cluster-state=existing` 需要种子地址。
 
-本系统将节点的生命周期严格划分为 **4 个标准化阶段（Phases）** ，确保状态机流转的确定性。
+1. 连接任一可用种子地址。
+2. 调用 etcd `MemberAdd`。
+3. 获取最新成员列表。
+4. 构造 `initial-cluster`。
+5. 启动本地内嵌 etcd。
+6. 连接本地 client 广播地址。
 
-``` mermaid
-graph TD
-    A[Phase 1: 启动与环境准备] --> B[自动探测本机局域网 IP]
-    B --> C{Phase 2: 角色与拓扑路由}
-    
-    C -->|role=agent| D[仅创建 etcd Client 连接 seed_endpoints]
-    
-    C -->|role=server| E{cluster_state?}
-    E -->|new| F[作为创始节点, 启动本地嵌入式 etcd]
-    F --> G[创建本地 127.0.0.1 Client]
-    
-    E -->|existing| H[创建临时 Client 连接现有集群]
-    H --> I[调用 MemberAdd 注册自身 Peer URL]
-    I --> J[获取最新集群成员, 动态生成 InitialCluster 拓扑]
-    J --> K[关闭临时 Client, 以 existing 模式启动本地 etcd]
-    K --> K1{本地 etcd 启动成功?}
-    K1 -->|yes| G
-    K1 -->|no| K2[回连 seed_endpoints 执行 MemberRemove]
-    K2 --> K3[清理失败则标记 Pending-Reconcile, 后台重试]
-    
-    D --> L[Phase 3: 节点注册与保活]
-    G --> L
-    L --> M[申请 10秒 TTL 租约 Lease]
-    M --> N[绑定 Lease 写入节点信息 JSON]
-    N --> O[启动异步 KeepAlive 心跳续租]
-    
-    O --> P[Phase 4: 后台守护任务]
-    P --> Q[启动 HTTP Admin 接口 /api/v1/nodes]
-    P --> R[启动 Monitoring Loop 动态更新 load]
+本地 etcd 启动失败时，应用删除新 member。
+删除失败时，协调器保存内存任务。
+协调器按 2 至 32 秒退避重试。
+进程退出后，任务不会持久保存。
+
+### 3.3 广播地址
+
+如果未指定广播地址，应用从监听地址推导。
+应用把首个 `0.0.0.0` 替换为节点 IP。
+显式地址适合多网卡和容器环境。
+
+## 4. 节点注册
+
+节点注册键格式如下：
+
+```text
+/mesh/nodes/{node-id}
 ```
 
-### 4.1 Phase 1: 环境探测
-
-摒弃复杂的静态配置，节点启动时若 ip\="auto"，程序会自动遍历宿主机网卡，获取非 127.0.0.1 且处于 UP 状态的真实 IPv4 地址，大幅提升易用性。
-
-### 4.2 Phase 2: 半自动热扩容（Auto-Join 机制）
-
-**这是本系统的核心亮点。**  当一个新的 Server 节点准备加入已有集群时（existing 模式）：
-
-*. 节点不会盲目启动 etcd 服务，而是先以轻量级 Client 身份连接到 seed\_endpoints。
-*. 调用 MemberAdd API，向现有 Raft 集群预宣告自己的存在（注册 Peer URL）。
-*. 根据 API 返回的当前集群拓扑，在内存中动态拼接 InitialCluster 配置字符串。
-*. 随后再真正拉起本地的内嵌 etcd 实例，同步日志。
-*. **启动失败兜底**：若在 MemberAdd 成功后，本地 etcd 启动失败，节点必须立即回连集群执行 MemberRemove 清理“幽灵成员”。
-*. **二级兜底**：若网络异常导致 MemberRemove 失败，记录该成员为 `Pending-Reconcile` 并由后台协程指数退避重试，直到清理成功。
-*. **边界说明**：TTL 仅作用于 `/mesh/nodes/*` 的业务注册键，**不会**自动清理 etcd 的 raft member 元数据，因此不能仅依赖 TTL 处理 Server 加入失败。
-   设计收益：实现了 Server 扩容的“零干预”，用户无需手动调用 etcdctl 重置配置。
-
-### 4.3 Phase 3: 租约保活（Lease KeepAlive）
-
-放弃低效的定时 Put 覆盖机制。节点启动后向 etcd 申请一个 10 秒存活期（TTL）的**租约（Lease）** ，并在写入自身节点 JSON 时绑定该租约。
-依靠 etcd SDK 底层的多路复用长连接执行 KeepAlive 续租。一旦节点崩溃或网络脑裂，租约到期后 etcd 将自动删除该节点的数据，实现拓扑自动收敛。
-
-### 4.4 Phase 4: 后台守护与可观测性
-
-不阻塞主线程，启动两个主要的 Goroutine：
-
-*. **Admin HTTP Server (15000 端口)** ：暴露 `GET /api/v1/nodes` 接口。该接口通过 etcd 的 WithPrefix() 聚合查询 /mesh/nodes/ 下的所有数据，向外端提供实时的 Mesh 拓扑视图。
-*. **Monitoring Loop**：每 15 秒生成一次当前负载指标（Load），带上原有的 LeaseID 进行 etcd Put 更新。
-
----
-
-## 5. 接口设计与外部交互
-
-为了保障控制面的可观测性（Observability）与可管理性（Manageability），系统在 Admin 端口（默认 `:15000`）提供 RESTful HTTP API。
-
-当前已实现的 API 分为三类：探针与诊断、节点拓扑治理、服务配置。
-
-### 5.1 探针与诊断接口 (Diagnostics API)
-
-- **Readiness Probe**
-  - 接口：`GET /health`
-  - 用途：进程存活与版本探针。
-  - 响应示例：
+节点值包含以下字段：
 
 ```json
 {
-  "status": "UP",
-  "version": "v0.1.0"
-}
-```
-
-- **Cluster Status（Raft 选举与成员视图）**
-  - 接口：`GET /api/v1/cluster/status`
-  - 用途：查看 leader、raft term/index、成员角色（leader/follower/learner）。
-  - 响应示例：
-
-```json
-{
-  "endpoint": "http://server-1:2379",
-  "cluster_id": 14841639068965178418,
-  "current_member_id": 10276657743932975437,
-  "leader_id": 10276657743932975437,
-  "raft_term": 3,
-  "raft_index": 241,
-  "raft_applied_index": 241,
-  "db_size": 32768,
-  "members": [
-    {
-      "id": 10276657743932975437,
-      "name": "server-1",
-      "role": "leader",
-      "is_learner": false,
-      "peer_urls": ["http://server-1:2380"],
-      "client_urls": ["http://server-1:2379"]
-    }
-  ]
-}
-```
-
-### 5.2 节点拓扑与治理接口 (Nodes API)
-
-- **获取全局节点拓扑**
-  - 接口：`GET /api/v1/nodes`
-  - 用途：展示当前存活节点与 etcd 角色。
-
-- **查询单节点详情**
-  - 接口：`GET /api/v1/nodes/:id`
-  - 用途：查看节点状态和系统负载快照。
-
-- **驱逐节点（Evict）**
-  - 接口：`DELETE /api/v1/nodes/:id`
-  - 可选参数：`force=true`
-  - 语义：
-    - 目标为 Agent：删除 `/mesh/nodes/:id`。
-    - 目标为 Server：删除节点注册键后，尝试 `MemberRemove` 清理 raft member。
-    - 目标为当前 leader 且未携带 `force=true`：拒绝执行并返回 `409`。
-  - 响应示例：
-
-```json
-{
-  "node_id": "server-2",
-  "node_role": "server",
-  "node_deleted": true,
-  "member_id": 13284210527009912341,
-  "member_removed": true
-}
-```
-
-### 5.3 服务配置接口 (Services API)
-
-当前版本已覆盖服务配置的创建、查询、删除与并发安全更新（CAS），持久化到 `/mesh/services/`（不绑定租约）。
-
-- **创建/覆盖服务路由配置**
-  - 接口：`POST /api/v1/services`
-  - 审计字段：可通过请求头 `X-Operator` 传入操作者；系统会写入 `updated_by` 与 `updated_at`。
-  - 请求示例：
-
-```json
-{
-  "name": "payment-svc",
-  "namespace": "prod",
-  "version": "v1",
-  "routes": [
-    {
-      "path_prefix": "/",
-      "destination": "payment-v1",
-      "weight": 100
-    }
-  ]
-}
-```
-
-- **获取全部服务配置**
-  - 接口：`GET /api/v1/services`
-  - 响应示例：
-
-```json
-[
-  {
-    "name": "payment-svc",
-    "namespace": "prod",
-    "version": "v1",
-    "routes": [
-      {
-        "path_prefix": "/",
-        "destination": "payment-v1",
-        "weight": 100
-      }
-    ]
+  "id": "server-1",
+  "ip": "10.0.0.11",
+  "version": "v0.1.0",
+  "node_status": {
+    "mesh_role": "server",
+    "node_status": "Ready"
+  },
+  "sys_load": {
+    "cpu_usage": 0,
+    "memory_usage": 0,
+    "system_load_1m": 0
   }
-]
+}
 ```
 
-- **查询单个服务配置**
-  - 接口：`GET /api/v1/services/:name`
-  - 用途：按服务名读取当前生效路由配置。
+应用先申请租约，再写入节点注册键。
+默认租约 TTL 为 10 秒。
+etcd SDK 持续发送 KeepAlive。
 
-- **更新服务配置（CAS）**
-  - 接口：`PUT /api/v1/services/:name?resource_version=<rev>`
-  - 语义：仅当 etcd 当前 `mod_revision == resource_version` 时更新成功；否则返回 `409`。
-  - 说明：`resource_version` 也可从请求体 `resource_version` 字段读取，查询参数优先级更高。
-  - 冲突响应：`409` 会返回 `current_resource_version` 与 `current_config`，便于客户端直接重试或合并。
+KeepAlive 通道关闭后，应用重建租约。
+重试间隔从 1 秒增加到 8 秒。
+新租约会重新写入节点注册键。
 
-- **删除服务配置**
-  - 接口：`DELETE /api/v1/services/:name`
-  - 语义：删除对应服务配置；不存在时返回 `404`。
+正常退出时，应用撤销当前租约。
+异常退出时，etcd 在 TTL 到期后删键。
 
-### 5.4 当前实现状态（2026-03）
+## 5. 节点视图
 
-- 已实现：`/health`、`/api/v1/cluster/status`、`/api/v1/nodes`、`/api/v1/nodes/:id (GET/DELETE)`、`/api/v1/services (GET/POST)`、`/api/v1/services/:name (GET/PUT/DELETE)`。
-- 已实现安全策略：leader 驱逐默认拒绝，需显式 `force=true`。
-- 已实现审计元数据：`updated_by`、`updated_at`（支持 `X-Operator`）。
-- 待实现：服务配置版本历史回溯。
+`GET /api/v1/nodes` 先读取节点注册键。
+接口再查询 etcd 成员和 leader。
+Server 的 `etcd_role` 为以下值：
 
----
+- `leader`
+- `follower`
+- `unknown`
 
-## 6. 异常处理与容灾机制 (Fault Tolerance)
+Agent 的 `etcd_role` 为 `agent`。
+etcd 状态查询失败时，Server 显示 `unknown`。
 
-*. **Agent 节点失联**：底层 KeepAlive 失败，10 秒后 Server 端租约过期，该 Agent 自动从 `/api/v1/nodes` 拓扑中消失。
-*. **Server 节点崩溃**：
+接口最后读取 SoftKV 节点指标。
+指标键格式为 `metrics/nodes/{node-id}`。
+存在指标时，接口填充 `sys_load`。
 
-- 若为 3 节点集群挂掉 1 台，剩余 2 台满足
+单节点详情接口不填充 SoftKV 指标。
+该接口返回注册键内的原始值。
 
-  ```rendered
-  N/2+1=2
+## 6. 节点驱逐
 
-  ```
+Agent 驱逐只删除节点注册键。
+Server 驱逐还会删除 etcd member。
 
-  的 Quorum，集群正常读写，系统自动发起新一轮 Raft 选举。
-- 若挂掉 2 台，失去 Quorum，etcd 拒绝写操作，进入只读模式保护现有拓扑，等待节点恢复。
-*. **Server 加入失败（MemberAdd 后未成功启动）**：优先执行 MemberRemove 主动回滚；若短时不可达则进入后台重试清理。仅等待 TTL 过期只能清理 `/mesh/nodes/*`，无法清理 raft member，不能作为唯一兜底手段。
-*. **误驱逐 Leader 防护**：驱逐接口默认拒绝删除 leader（返回 `409`），必须由管理员携带 `force=true` 显式确认，降低误操作导致的可用性风险。
-  *. **优雅停机 (Graceful Shutdown)** ：主进程捕获 SIGTERM/SIGINT 信号后，主动调用 embed.Etcd.Close() 和 Client.Close()，确保落盘数据不损坏，并主动释放 Lease。
+驱逐 Server 时，控制面先查成员列表。
+如果目标是 leader，接口默认返回 `409`。
+调用方必须传入 `force=true`。
 
----
+控制面先删除节点注册键。
+控制面之后调用 `MemberRemove`。
+如果删除 member 失败，注册键不会恢复。
+调用方必须检查响应和集群状态。
 
-## 7. 演进路线 (Future Work)
+驱逐不会停止目标进程。
+仍在运行的节点可能重建租约。
+运维系统应先停止目标进程。
 
-本控制面骨架就绪后，未来的扩展方向包括：
+## 7. 服务配置
 
-*. **服务发现与 Endpoint 管理**：增加 /mesh/services/{svc\_name}/endpoints/ 命名空间，允许业务微服务注册。
-*. **xDS 协议集成**：控制平面实现 gRPC xDS Server，将 etcd 中的拓扑和路由规则转换为 Envoy Proxy 能识别的 CDS/EDS 配置，下发给数据面。
-*. **Gossip 补充协议**：引入 HashiCorp memberlist，利用 Gossip 协议在超大规模集群中补充节点健康检查机制，降低 etcd 的读写压力。
+服务配置键格式如下：
+
+```text
+/mesh/services/{name}
+```
+
+服务配置不绑定租约。
+POST 使用 etcd Put 语义。
+同名配置会直接覆盖。
+
+写入前，服务注册表补全默认值。
+服务注册表随后校验全部字段。
+服务端写入 UTC 审计时间。
+操作者默认值为 `api`。
+
+GET 使用 etcd `ModRevision` 填充 `resource_version`。
+存储值本身不保存该版本号。
+
+## 8. CAS 更新
+
+PUT 使用乐观并发控制。
+查询参数中的版本号优先。
+请求体版本号作为回退值。
+
+etcd 事务比较当前 `ModRevision`。
+版本一致时，事务写入配置。
+版本不一致时，接口返回 `409`。
+响应包含当前版本和当前配置。
+
+DELETE 不使用 CAS。
+并发删除和更新需要调用方协调。
+
+## 9. 一致性与故障
+
+Raft 写入需要多数派。
+两个 Server 不能容忍一台故障。
+双节点部署应使用 1S1A。
+高可用部署应使用奇数个 Server。
+
+租约只管理节点注册键。
+租约不管理 etcd member。
+Server 异常退出后，member 仍保留。
+恢复或驱逐必须单独处理 member。
+
+服务配置编译失败时，etcd 仍保留配置。
+各节点流量面保留旧运行计划。
+调用方应先使用匹配接口验证配置。
+
+## 10. 安全边界
+
+当前管理接口没有鉴权。
+当前接口没有操作审计存储。
+`updated_by` 由调用方提供。
+该字段不能证明真实身份。
+
+当前 etcd URL 默认使用 HTTP。
+当前 Gossip 也不启用加密。
+部署环境必须限制端口访问。
